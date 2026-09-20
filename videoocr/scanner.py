@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import VIDEO_EXTENSIONS
+from .config import TRANSLATED_SUFFIX, VIDEO_EXTENSIONS
 
 
 @dataclass(frozen=True)
@@ -23,11 +23,18 @@ class Entry:
     size: int
     has_srt: bool
     relative: str      # đường dẫn tương đối so với thư mục gốc, để hiện cho gọn
+    vi: Path | None = None
+    has_vi: bool = False
 
 
 def srt_path_for(video: Path) -> Path:
     """video.mp4 -> video.srt, nằm cùng thư mục."""
     return video.with_suffix(".srt")
+
+
+def vi_path_for(video: Path) -> Path:
+    """phim.mp4 -> phim.vi.srt, nằm cạnh bản nguyên ngữ."""
+    return video.with_name(video.stem + TRANSLATED_SUFFIX)
 
 
 def has_subtitle(srt: Path) -> bool:
@@ -93,12 +100,15 @@ def scan_entries(root: Path, recursive: bool = True) -> list[Entry]:
         except ValueError:  # pragma: no cover - find_videos luôn trả về file trong root
             relative = video.name
 
+        vi = vi_path_for(video)
         entries.append(Entry(
             video=video,
             srt=srt,
             size=size,
             has_srt=has_subtitle(srt),
             relative=relative,
+            vi=vi,
+            has_vi=has_subtitle(vi),
         ))
 
     return entries

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 # Danh sách ngôn ngữ cho dropdown. Hai thứ tiếng chính đặt lên đầu.
@@ -40,6 +40,11 @@ CHINESE_VARIANTS: list[tuple[str, str]] = [
 # Câu mồi đẩy model về tiếng phổ thông, ưu tiên giản thể và quan trọng nhất
 # là buộc nó chấm câu - bộ cắt dòng dựa vào dấu câu để ngắt cho đẹp.
 DEFAULT_ZH_PROMPT = "以下是普通话的句子。"
+
+# Đuôi của bản dịch: phim.mp4 -> phim.srt (nguyên ngữ) + phim.vi.srt (tiếng Việt).
+TRANSLATED_SUFFIX = ".vi.srt"
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
@@ -93,6 +98,12 @@ class Settings:
 
     # Nơi tải và lưu model. Rỗng = thư mục models\ cạnh app.
     model_dir: str = ""
+
+    # Dịch sang tiếng Việt bằng Gemini.
+    translate_enabled: bool = False
+    gemini_keys: list[str] = field(default_factory=list)
+    gemini_model: str = DEFAULT_GEMINI_MODEL
+    translate_batch_size: int = 40
 
     def save(self, path: Path | None = None) -> None:
         target = path or settings_path()

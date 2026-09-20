@@ -59,6 +59,24 @@ def join_words(words: list[Word]) -> str:
     return "".join(w.text for w in words).strip()
 
 
+def join_display_lines(text: str) -> str:
+    """Gộp các dòng của một khối phụ đề lại thành một câu liền.
+
+    Chỗ xuống dòng nằm giữa hai chữ CJK thì nối thẳng, vì tiếng Trung không có
+    dấu cách giữa từ - chèn khoảng trắng vào là làm sai câu. Các trường hợp còn
+    lại (chữ Latin) thì nối bằng một khoảng trắng như bình thường.
+    """
+    parts = [part.strip() for part in text.splitlines() if part.strip()]
+    if not parts:
+        return ""
+
+    joined = parts[0]
+    for part in parts[1:]:
+        separator = "" if is_cjk_char(joined[-1]) and is_cjk_char(part[0]) else " "
+        joined += separator + part
+    return joined
+
+
 def format_timestamp(seconds: float) -> str:
     """Giây -> 'HH:MM:SS,mmm' theo chuẩn SRT."""
     if seconds < 0:
@@ -233,6 +251,59 @@ def finalize_cues(
             cue.end = max(out[i + 1].start, cue.start + 0.05)
 
     return out
+
+
+_TIMECODE = re.compile(
+    r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d+):(\d{2}):(\d{2})[,.](\d{1,3})"
+)
+
+
+def parse_timestamp(hours: str, minutes: str, seconds: str, millis: str) -> float:
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(millis.ljust(3, "0")) / 1000
+    )
+
+
+def parse_srt(text: str) -> list[Cue]:
+    """Đọc nội dung file SRT thành danh sách khối.
+
+    Bỏ qua số thứ tự trong file và đánh lại khi ghi ra, nên file đánh số lộn xộn
+    vẫn đọc được.
+    """
+    cues: list[Cue] = []
+    blocks = re.split(r"\r?\n\s*\r?\n", text.lstrip("﻿").strip())
+
+    for block in blocks:
+        lines = [line.rstrip("\r") for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+
+        timing = None
+        body_start = 0
+        for position, line in enumerate(lines[:2]):
+            match = _TIMECODE.search(line)
+            if match:
+                timing = match
+                body_start = position + 1
+                break
+        if timing is None:
+            continue
+
+        body = "\n".join(lines[body_start:]).strip()
+        if not body:
+            continue
+
+        groups = timing.groups()
+        cues.append(Cue(
+            start=parse_timestamp(*groups[:4]),
+            end=parse_timestamp(*groups[4:]),
+            text=body,
+        ))
+
+    return cues
 
 
 def render_srt(cues: list[Cue]) -> str:

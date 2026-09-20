@@ -35,6 +35,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", help="Câu mồi cho model")
     parser.add_argument("--model-dir",
                         help="Thư mục lưu model. Bỏ trống là models\ cạnh app")
+    group = parser.add_argument_group("Dịch tiếng Việt bằng Gemini")
+    group.add_argument("--translate", action="store_true",
+                       help="Dịch sang tiếng Việt sau khi nhận dạng, xuất ra phim.vi.srt")
+    group.add_argument("--translate-only", action="store_true",
+                       help="Chỉ dịch các file .srt đã có, không nhận dạng lại")
+    group.add_argument("--gemini-key", action="append", metavar="KEY",
+                       help="API key Gemini. Lặp lại tham số này để thêm nhiều key")
+    group.add_argument("--gemini-model", help="Model Gemini (mặc định gemini-2.5-flash)")
+    group.add_argument("--translate-batch", type=int, metavar="N",
+                       help="Số dòng gửi mỗi lượt gọi API (mặc định 40)")
+
     return parser
 
 
@@ -63,6 +74,14 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         settings.initial_prompt = args.prompt
     if args.model_dir is not None:
         settings.model_dir = args.model_dir
+    if args.gemini_key:
+        settings.gemini_keys = list(args.gemini_key)
+    if args.gemini_model:
+        settings.gemini_model = args.gemini_model
+    if args.translate_batch:
+        settings.translate_batch_size = args.translate_batch
+    if args.translate or args.translate_only:
+        settings.translate_enabled = True
 
     if args.no_recursive:
         settings.recursive = False
@@ -105,8 +124,9 @@ def main(argv: list[str] | None = None) -> int:
     settings = settings_from_args(args)
     settings.save()
 
+    action = pipeline.translate_existing if args.translate_only else pipeline.run
     try:
-        summary = pipeline.run(settings, emit=_report, cancel=threading.Event())
+        summary = action(settings, emit=_report, cancel=threading.Event())
     except KeyboardInterrupt:
         print("\nĐã huỷ.", file=sys.stderr)
         return 130

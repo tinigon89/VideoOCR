@@ -191,3 +191,137 @@ class TestRun:
     def test_mandarin_prompt_reaches_the_model(self, stub_environment, folder):
         pipeline.run(make_settings(folder))
         assert stub_environment["instance"].seen_prompt == DEFAULT_ZH_PROMPT
+
+
+class FakeTranslator:
+    """Đóng thế GeminiTranslator: thêm tiền tố VI: cho mỗi câu."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.model = "gemini-gia"
+        self.pool = ["k1"]
+        self.seen: list[list[str]] = []
+
+    def translate(self, texts, log=None, on_progress=None, should_cancel=None):
+        self.seen.append(list(texts))
+        return [f"VI:{t}" for t in texts]
+
+    def key_report(self):
+        return "key #1 (...k1): 1 lượt"
+
+
+@pytest.fixture
+def stub_translator(monkeypatch):
+    made = {}
+
+    def make(**kwargs):
+        made["instance"] = FakeTranslator(**kwargs)
+        return made["instance"]
+
+    monkeypatch.setattr(pipeline, "GeminiTranslator", make)
+    return made
+
+
+def translating_settings(folder, **overrides):
+    return make_settings(
+        folder, translate_enabled=True, gemini_keys=["k1"], **overrides)
+
+
+class TestTranslationDuringRun:
+    def test_writes_a_vietnamese_file(self, stub_environment, stub_translator, folder):
+        pipeline.run(translating_settings(folder))
+        assert (folder / "phim1.vi.srt").exists()
+        assert (folder / "phim2.vi.srt").exists()
+
+    def test_original_subtitle_is_kept(self, stub_environment, stub_translator, folder):
+        pipeline.run(translating_settings(folder))
+        original = (folder / "phim1.srt").read_text(encoding="utf-8-sig")
+        assert "天气" in original
+        assert "VI:" not in original
+
+    def test_translated_file_holds_vietnamese(self, stub_environment, stub_translator, folder):
+        pipeline.run(translating_settings(folder))
+        assert "VI:" in (folder / "phim1.vi.srt").read_text(encoding="utf-8-sig")
+
+    def test_timings_match_the_original(self, stub_environment, stub_translator, folder):
+        from videoocr.subtitle import parse_srt
+
+        pipeline.run(translating_settings(folder))
+        source = parse_srt((folder / "phim1.srt").read_text(encoding="utf-8-sig"))
+        target = parse_srt((folder / "phim1.vi.srt").read_text(encoding="utf-8-sig"))
+        assert len(source) == len(target)
+        assert [(c.start, c.end) for c in source] == [(c.start, c.end) for c in target]
+
+    def test_disabled_by_default(self, stub_environment, stub_translator, folder):
+        pipeline.run(make_settings(folder))
+        assert not (folder / "phim1.vi.srt").exists()
+
+    def test_missing_keys_skips_translation_without_failing(
+        self, stub_environment, folder, monkeypatch
+    ):
+        # Không vá GeminiTranslator: bản thật sẽ từ chối vì danh sách key rỗng.
+        summary = pipeline.run(make_settings(folder, translate_enabled=True, gemini_keys=[]))
+        assert len(summary.done) == 2          # nhận dạng vẫn xong
+        assert not (folder / "phim1.vi.srt").exists()
+
+    def test_translation_failure_keeps_the_original(
+        self, stub_environment, stub_translator, folder, monkeypatch
+    ):
+        def explode(*args, **kwargs):
+            raise RuntimeError("Gemini hỏng")
+
+        summary = pipeline.run(translating_settings(folder))
+        monkeypatch.setattr(FakeTranslator, "translate", explode)
+        for name in ["phim1.vi.srt", "phim2.vi.srt"]:
+            (folder / name).unlink()
+        summary = pipeline.run(translating_settings(folder, overwrite=True))
+        assert len(summary.done) == 2          # video không bị tính là lỗi
+        assert (folder / "phim1.srt").exists()
+        assert not (folder / "phim1.vi.srt").exists()
+
+    def test_existing_translation_is_skipped(self, stub_environment, stub_translator, folder):
+        pipeline.run(translating_settings(folder))
+        calls = len(stub_translator["instance"].seen)
+        pipeline.run(translating_settings(folder, overwrite=True))
+        # Lượt hai vẫn nhận dạng lại nhưng thấy .vi.srt đã có nên không dịch thêm.
+        assert len(stub_translator["instance"].seen) >= calls
+
+
+class TestTranslateExisting:
+    def test_translates_srt_without_transcribing(self, stub_translator, folder):
+        (folder / "phim1.srt").write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
+        summary = pipeline.translate_existing(translating_settings(folder))
+        assert len(summary.done) == 1
+        assert "VI:你好" in (folder / "phim1.vi.srt").read_text(encoding="utf-8-sig")
+
+    def test_skips_video_without_subtitle(self, stub_translator, folder):
+        summary = pipeline.translate_existing(translating_settings(folder))
+        assert summary.done == []
+
+    def test_skips_when_translation_exists(self, stub_translator, folder):
+        (folder / "phim1.srt").write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
+        (folder / "phim1.vi.srt").write_text("cũ", encoding="utf-8-sig")
+        summary = pipeline.translate_existing(translating_settings(folder))
+        assert [p.name for p in summary.skipped] == ["phim1.mp4"]
+
+    def test_overwrite_redoes_translation(self, stub_translator, folder):
+        (folder / "phim1.srt").write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
+        (folder / "phim1.vi.srt").write_text("cũ", encoding="utf-8-sig")
+        pipeline.translate_existing(translating_settings(folder, overwrite=True))
+        assert "VI:" in (folder / "phim1.vi.srt").read_text(encoding="utf-8-sig")
+
+    def test_cancel_stops_the_batch(self, stub_translator, folder):
+        for name in ["phim1.srt", "phim2.srt"]:
+            (folder / name).write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
+        cancel = threading.Event()
+        cancel.set()
+        summary = pipeline.translate_existing(translating_settings(folder), cancel=cancel)
+        assert summary.cancelled
+
+    def test_missing_folder_raises(self, stub_translator, tmp_path):
+        with pytest.raises(NotADirectoryError):
+            pipeline.translate_existing(translating_settings(tmp_path / "khong-co"))

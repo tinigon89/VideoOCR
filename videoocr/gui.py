@@ -16,6 +16,7 @@ from . import pipeline
 from .config import (
     CHINESE_VARIANTS,
     COMPUTE_TYPES,
+    DEFAULT_GEMINI_MODEL,
     ENGLISH_ONLY_MODELS,
     LANGUAGES,
     MODELS,
@@ -25,6 +26,7 @@ from .config import (
 )
 from .gpu import gpu_name
 from .scanner import Entry, format_size, scan_entries
+from .translator import SUGGESTED_MODELS, check_key
 
 POLL_INTERVAL_MS = 100
 
@@ -45,6 +47,7 @@ STATUS_COLORS = {
 
 STATUS_TODO = "Chưa có SRT"
 STATUS_HAVE = "Đã có SRT"
+STATUS_HAVE_VI = "Đã có SRT + bản dịch"
 
 
 class App(ttk.Frame):
@@ -83,11 +86,12 @@ class App(ttk.Frame):
 
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=3)   # bảng danh sách
-        self.rowconfigure(4, weight=1)   # nhật ký
+        self.rowconfigure(3, weight=3)   # bảng danh sách
+        self.rowconfigure(5, weight=1)   # nhật ký
 
         self._build_folder()
         self._build_options()
+        self._build_translate()
         self._build_list()
         self._build_progress()
         self._build_log()
@@ -160,9 +164,48 @@ class App(ttk.Frame):
             "nếu muốn dùng lại model đã tải cho phần mềm khác."
         )).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
+    def _build_translate(self) -> None:
+        frame = ttk.LabelFrame(self, text="Dịch sang tiếng Việt (Google Gemini)", padding=8)
+        frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        frame.columnconfigure(1, weight=1)
+
+        self.var_translate = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame, text="Dịch tự động sau khi nhận dạng xong (xuất ra phim.vi.srt)",
+            variable=self.var_translate,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(frame, text="API key:").grid(row=1, column=0, sticky="nw", pady=(6, 0))
+        self.keys_box = tk.Text(frame, height=3, wrap="none", font=("Consolas", 9))
+        self.keys_box.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        keys_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.keys_box.yview)
+        keys_scroll.grid(row=1, column=2, sticky="ns", pady=(6, 0))
+        self.keys_box.configure(yscrollcommand=keys_scroll.set)
+
+        ttk.Label(frame, foreground="#666666", text=(
+            "Mỗi dòng một key. Hết hạn mức hoặc key hỏng thì tự chuyển sang key kế tiếp. "
+            "Lưu ý: Google tính hạn mức theo project, nhiều key cùng project vẫn chung quota."
+        )).grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
+
+        bottom = ttk.Frame(frame)
+        bottom.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        bottom.columnconfigure(1, weight=1)
+
+        ttk.Label(bottom, text="Model Gemini:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.var_gemini_model = tk.StringVar(value=DEFAULT_GEMINI_MODEL)
+        ttk.Combobox(bottom, textvariable=self.var_gemini_model,
+                     values=SUGGESTED_MODELS, width=24).grid(row=0, column=1, sticky="w")
+
+        self.btn_check_keys = ttk.Button(bottom, text="Kiểm tra key",
+                                         command=self._check_keys)
+        self.btn_check_keys.grid(row=0, column=2, padx=(8, 0))
+        self.btn_translate = ttk.Button(bottom, text="Dịch các SRT đã có",
+                                        command=self._translate_existing)
+        self.btn_translate.grid(row=0, column=3, padx=(4, 0))
+
     def _build_list(self) -> None:
         frame = ttk.LabelFrame(self, text="Danh sách video", padding=8)
-        frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
 
@@ -185,7 +228,7 @@ class App(ttk.Frame):
         self.tree.heading("status", text="Trạng thái")
         self.tree.column("name", width=420, anchor="w")
         self.tree.column("size", width=110, anchor="e", stretch=False)
-        self.tree.column("status", width=190, anchor="w", stretch=False)
+        self.tree.column("status", width=210, anchor="w", stretch=False)
         self.tree.grid(row=1, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -197,7 +240,7 @@ class App(ttk.Frame):
 
     def _build_progress(self) -> None:
         frame = ttk.Frame(self)
-        frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         frame.columnconfigure(1, weight=1)
 
         self.var_status = tk.StringVar(value="Sẵn sàng.")
@@ -221,7 +264,7 @@ class App(ttk.Frame):
 
     def _build_log(self) -> None:
         frame = ttk.LabelFrame(self, text="Nhật ký", padding=4)
-        frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -285,7 +328,11 @@ class App(ttk.Frame):
         for entry in result:
             key = str(entry.video)
             self.has_srt[key] = entry.has_srt
-            self.status[key] = (STATUS_HAVE, "have") if entry.has_srt else (STATUS_TODO, "todo")
+            if entry.has_srt:
+                label = STATUS_HAVE_VI if entry.has_vi else STATUS_HAVE
+                self.status[key] = (label, "have")
+            else:
+                self.status[key] = (STATUS_TODO, "todo")
 
         self._render_tree()
 
@@ -352,6 +399,10 @@ class App(ttk.Frame):
         self.var_vad.set(s.vad_filter)
         self.var_filter.set(s.filter_hallucinations)
         self.var_model_dir.set(s.model_dir)
+        self.var_translate.set(s.translate_enabled)
+        self.var_gemini_model.set(s.gemini_model or DEFAULT_GEMINI_MODEL)
+        self.keys_box.delete("1.0", "end")
+        self.keys_box.insert("1.0", "\n".join(s.gemini_keys))
 
         self.var_language.set(next(
             (label for label, code in LANGUAGES if code == s.language), LANGUAGES[0][0]))
@@ -370,6 +421,9 @@ class App(ttk.Frame):
         s.vad_filter = self.var_vad.get()
         s.filter_hallucinations = self.var_filter.get()
         s.model_dir = self.var_model_dir.get().strip()
+        s.translate_enabled = self.var_translate.get()
+        s.gemini_keys = self._read_keys()
+        s.gemini_model = self.var_gemini_model.get().strip() or DEFAULT_GEMINI_MODEL
         s.language = dict(LANGUAGES).get(self.var_language.get())
         s.chinese_variant = dict(CHINESE_VARIANTS).get(self.var_variant.get(), "s")
         return s
@@ -423,10 +477,70 @@ class App(ttk.Frame):
         self.bar_file["value"] = 0
         self.bar_total["value"] = 0
         self.btn_start.configure(state="disabled")
+        self.btn_translate.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.var_status.set("Đang chuẩn bị...")
 
         self.worker = threading.Thread(target=self._work, args=(settings,), daemon=True)
+        self.worker.start()
+
+    def _read_keys(self) -> list[str]:
+        raw = self.keys_box.get("1.0", "end")
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+
+    def _check_keys(self) -> None:
+        """Hỏi Gemini xem từng key còn dùng được không và có model nào."""
+        keys = self._read_keys()
+        if not keys:
+            messagebox.showinfo("Chưa có key", "Hãy dán ít nhất một API key.")
+            return
+
+        self.btn_check_keys.configure(state="disabled")
+        self._log(f"Đang kiểm tra {len(keys)} key...")
+
+        def work() -> None:
+            for position, key in enumerate(keys, start=1):
+                tail = key[-4:] if len(key) >= 4 else "????"
+                ok, note = check_key(key)
+                self.events.put(pipeline.Event(
+                    kind="log",
+                    level="success" if ok else "error",
+                    message=f"key #{position} (...{tail}): {note}",
+                ))
+            self.events.put(pipeline.Event(kind="keys_checked"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _translate_existing(self) -> None:
+        """Dịch các file .srt có sẵn, không nhận dạng lại."""
+        if self.worker is not None and self.worker.is_alive():
+            return
+
+        settings = self._collect_settings()
+        if not settings.input_dir or not Path(settings.input_dir).is_dir():
+            messagebox.showerror("Thiếu thư mục", "Hãy chọn một thư mục chứa video.")
+            return
+        if not settings.gemini_keys:
+            messagebox.showerror("Thiếu API key", "Hãy dán ít nhất một API key của Gemini.")
+            return
+
+        settings.save()
+        self.cancel.clear()
+        self.bar_file["value"] = 0
+        self.bar_total["value"] = 0
+        self.btn_start.configure(state="disabled")
+        self.btn_translate.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.var_status.set("Đang dịch...")
+
+        def work() -> None:
+            try:
+                pipeline.translate_existing(settings, emit=self.events.put, cancel=self.cancel)
+            except Exception as exc:
+                self.events.put(pipeline.Event(kind="finished", level="error",
+                                               message=f"Dừng vì lỗi: {exc}"))
+
+        self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
 
     def _stop(self) -> None:
@@ -475,8 +589,17 @@ class App(ttk.Frame):
             if event.level == "error":
                 self._set_status(event.path, "Lỗi", "error", has_srt=False)
             else:
-                self._set_status(event.path, f"Xong · {event.cues} khối", "have", has_srt=True)
+                suffix = " + dịch" if "đã dịch" in event.message else ""
+                self._set_status(event.path, f"Xong · {event.cues} khối{suffix}",
+                                 "have", has_srt=True)
             self._log(f"[{event.index}/{event.total}] {event.message}", event.level)
+
+        elif event.kind == "translating":
+            self._set_status(event.path, "Đang dịch...", "running")
+            self._log(event.message, event.level)
+
+        elif event.kind == "keys_checked":
+            self.btn_check_keys.configure(state="normal")
 
         elif event.kind == "finished":
             if event.level == "success":
@@ -484,6 +607,7 @@ class App(ttk.Frame):
             self.var_status.set(event.message)
             self._log(event.message, event.level)
             self.btn_start.configure(state="normal")
+            self.btn_translate.configure(state="normal")
             self.btn_stop.configure(state="disabled")
 
         else:

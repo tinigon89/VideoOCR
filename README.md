@@ -1,9 +1,11 @@
 # VideoOCR
 
 Quét cả thư mục video, nhận dạng giọng nói trong audio và xuất ra file phụ đề `.srt`
-nằm cạnh từng video. Chạy hoàn toàn trên máy, không gửi gì lên mạng, không tốn phí API.
+nằm cạnh từng video. Phần nhận dạng chạy hoàn toàn trên máy, không gửi gì lên mạng
+và không tốn phí.
 
-Tối ưu sẵn cho tiếng Trung phổ thông (普通话) và tiếng Anh.
+Tối ưu sẵn cho tiếng Trung phổ thông (普通话) và tiếng Anh. Có thêm phần dịch sang
+tiếng Việt bằng Google Gemini — phần này thì có gọi ra mạng, và chỉ chạy khi bạn bật.
 
 ---
 
@@ -51,6 +53,7 @@ Trong lúc chạy, cột trạng thái đổi theo thời gian thực:
 | Đang xử lý... | Video đang được nhận dạng |
 | Xong · N khối | Đã xuất SRT với N khối phụ đề |
 | Lỗi | Không xử lý được, xem lý do ở nhật ký |
+| Đã có SRT + bản dịch | Có cả phụ đề nguyên ngữ lẫn bản tiếng Việt |
 
 Nút **Quét lại** làm mới danh sách nếu bạn vừa thêm hay xoá file bên ngoài.
 
@@ -82,6 +85,54 @@ cache chung của HuggingFace để dùng lại thay vì tải trùng:
 C:\Users\<tên>\.cache\huggingface\hub
 ```
 
+## Dịch sang tiếng Việt bằng Gemini
+
+Tích **"Dịch tự động sau khi nhận dạng xong"**, dán API key rồi chạy như bình thường.
+Mỗi video sẽ cho ra hai file:
+
+```
+EP01.mp4
+EP01.srt        <- nguyên ngữ (tiếng Trung)
+EP01.vi.srt     <- tiếng Việt
+```
+
+Bản gốc luôn được giữ lại. Nếu dịch hỏng giữa chừng, bạn vẫn còn phụ đề nguyên ngữ
+và chỉ cần bấm **"Dịch các SRT đã có"** để làm lại riêng phần dịch — không phải
+nhận dạng lại từ đầu.
+
+### Lấy API key
+
+Tạo miễn phí tại [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+
+### Nhiều key và cơ chế xoay vòng
+
+Dán **mỗi dòng một key**. Khi một key báo hết hạn mức, app tự chuyển sang key kế tiếp
+và cho key đó nghỉ một phút rồi mới dùng lại. Key sai hoặc bị thu hồi thì loại hẳn
+khỏi vòng quay ngay lần đầu.
+
+> **Quan trọng:** Google tính hạn mức theo **project**, không theo từng API key.
+> Nhiều key tạo trong cùng một project vẫn dùng chung một quota, xoay vòng sẽ không
+> tăng thêm được gì. Muốn có tác dụng thật, mỗi key phải thuộc một project khác nhau
+> (hoặc một tài khoản Google khác nhau).
+
+Nút **"Kiểm tra key"** hỏi thẳng Google xem từng key còn sống không và dùng được
+những model nào — tiện để biết tên model nào đang khả dụng với tài khoản của bạn.
+
+### Mốc thời gian có bị lệch không
+
+Không. App gửi từng lô phụ đề kèm số thứ tự và bắt Gemini trả về JSON đúng theo số
+thứ tự đó, nên số khối và mốc thời gian giữ nguyên tuyệt đối. Dòng nào Gemini bỏ sót
+thì giữ nguyên bản gốc chứ không làm xô lệch những dòng còn lại.
+
+### Nơi lưu API key
+
+Key được lưu cùng các thiết lập khác trong `%APPDATA%\VideoOCR\settings.json`, dạng
+văn bản thường, không mã hoá. File nằm ngoài thư mục app nên không lọt vào git, nhưng
+nếu máy dùng chung với người khác thì bạn nên cân nhắc.
+
+Nhật ký chỉ hiện 4 ký tự cuối của key (`key #1 (...aB3k)`), không bao giờ ghi cả key
+ra màn hình.
+
 ## Chạy bằng dòng lệnh
 
 ```bat
@@ -90,6 +141,12 @@ videoocr.bat "D:\Phim" --language zh --chinese s        REM tiếng Trung, ra gi
 videoocr.bat "D:\Phim" --language en --model distil-large-v3
 videoocr.bat "D:\Phim" --auto-language --overwrite
 videoocr.bat "D:\Phim" --compute-type int8_float16 --batch-size 4
+
+REM Dịch tiếng Việt, nhiều key thì lặp lại --gemini-key
+videoocr.bat "D:\Phim" --translate --gemini-key AIza... --gemini-key AIza...
+
+REM Chỉ dịch các .srt đã có, không nhận dạng lại
+videoocr.bat "D:\Phim" --translate-only --gemini-key AIza...
 ```
 
 `videoocr.bat --help` để xem toàn bộ tham số.
@@ -140,6 +197,7 @@ videoocr/
   cleaner.py      Lọc câu rác và khối lặp
   chinese.py      Chuyển giản thể <-> phồn thể bằng OpenCC
   pipeline.py     Điều phối toàn bộ, phát sự kiện tiến trình
+  translator.py   Gọi Gemini dịch tiếng Việt, xoay vòng API key
   gui.py          Cửa sổ tkinter
   cli.py          Giao diện dòng lệnh
 ```
@@ -152,5 +210,6 @@ GUI và CLI dùng chung `pipeline.run()`, nên sửa logic ở một nơi là c�
 .venv\Scripts\python.exe -m pytest tests -q
 ```
 
-Toàn bộ test chạy được mà không cần GPU và không cần ffmpeg — phần nhận dạng
-được thay bằng bản giả.
+Toàn bộ test chạy được mà không cần GPU, không cần ffmpeg và không gọi API thật —
+phần nhận dạng và phần gọi Gemini đều được thay bằng bản giả, nên chạy test không
+tốn hạn mức API.

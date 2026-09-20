@@ -1,5 +1,7 @@
 """Kiểm tra phần cắt dòng và dựng SRT - chạy được không cần GPU."""
 
+import pytest
+
 from videoocr.subtitle import (
     Cue,
     Word,
@@ -7,10 +9,22 @@ from videoocr.subtitle import (
     finalize_cues,
     format_timestamp,
     is_cjk_text,
+    join_display_lines,
+    parse_srt,
     render_srt,
     split_cue_by_length,
     wrap_text,
 )
+
+SAMPLE_SRT = """1
+00:00:01,200 --> 00:00:03,400
+今天天气很好
+
+2
+00:00:04,000 --> 00:00:06,500
+我们一起去
+公园散步吧
+"""
 
 
 def words(pairs, step=0.4, start=0.0):
@@ -52,6 +66,26 @@ class TestCjkDetection:
 
     def test_mixed_with_chinese_counts_as_cjk(self):
         assert is_cjk_text("今天用 Python 写代码")
+
+
+class TestJoinDisplayLines:
+    def test_chinese_lines_join_without_space(self):
+        assert join_display_lines("我们一起去\n公园散步吧") == "我们一起去公园散步吧"
+
+    def test_english_lines_join_with_space(self):
+        assert join_display_lines("the quick brown\nfox jumps") == "the quick brown fox jumps"
+
+    def test_space_across_scripts_is_kept(self):
+        assert join_display_lines("Hello\n世界") == "Hello 世界"
+
+    def test_inner_spaces_are_preserved(self):
+        assert join_display_lines("今天用 Python\n写代码") == "今天用 Python 写代码"
+
+    def test_single_line_unchanged(self):
+        assert join_display_lines("một dòng") == "một dòng"
+
+    def test_empty_text(self):
+        assert join_display_lines("  \n  ") == ""
 
 
 class TestWrapText:
@@ -167,3 +201,49 @@ class TestRenderSrt:
 
     def test_empty_list(self):
         assert render_srt([]) == ""
+
+
+class TestParseSrt:
+    def test_reads_every_block(self):
+        assert len(parse_srt(SAMPLE_SRT)) == 2
+
+    def test_reads_timestamps(self):
+        cues = parse_srt(SAMPLE_SRT)
+        assert cues[0].start == pytest.approx(1.2)
+        assert cues[0].end == pytest.approx(3.4)
+
+    def test_keeps_multi_line_text(self):
+        assert parse_srt(SAMPLE_SRT)[1].text == "我们一起去\n公园散步吧"
+
+    def test_handles_bom(self):
+        assert len(parse_srt("﻿" + SAMPLE_SRT)) == 2
+
+    def test_handles_crlf(self):
+        assert len(parse_srt(SAMPLE_SRT.replace("\n", "\r\n"))) == 2
+
+    def test_handles_dot_as_decimal_separator(self):
+        text = "1\n00:00:01.200 --> 00:00:03.400\nxin chào\n"
+        assert parse_srt(text)[0].start == pytest.approx(1.2)
+
+    def test_tolerates_wrong_numbering(self):
+        text = SAMPLE_SRT.replace("1\n00:00:01", "7\n00:00:01")
+        assert len(parse_srt(text)) == 2
+
+    def test_block_without_index_line(self):
+        text = "00:00:01,000 --> 00:00:02,000\nxin chào\n"
+        assert parse_srt(text)[0].text == "xin chào"
+
+    def test_skips_block_without_timecode(self):
+        text = "rác\n\n1\n00:00:01,000 --> 00:00:02,000\nxin chào\n"
+        assert len(parse_srt(text)) == 1
+
+    def test_skips_block_without_text(self):
+        text = "1\n00:00:01,000 --> 00:00:02,000\n\n2\n00:00:03,000 --> 00:00:04,000\nok\n"
+        assert len(parse_srt(text)) == 1
+
+    def test_empty_input(self):
+        assert parse_srt("") == []
+
+    def test_round_trip_through_render(self):
+        original = parse_srt(SAMPLE_SRT)
+        assert parse_srt(render_srt(original)) == original
