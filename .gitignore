@@ -1,0 +1,7 @@
+.venv/
+bin/
+models/
+__pycache__/
+*.pyc
+settings.json
+.pytest_cache/

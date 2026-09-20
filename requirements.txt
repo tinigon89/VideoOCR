@@ -1,0 +1,13 @@
+# Nhân nhận dạng giọng nói (CTranslate2, chạy CUDA)
+faster-whisper>=1.1.0
+
+# Thư viện CUDA cho Windows - CTranslate2 cần cuDNN 9 và cuBLAS 12.
+# Cài qua pip nên không phải cài CUDA Toolkit riêng.
+nvidia-cublas-cu12>=12.3
+nvidia-cudnn-cu12>=9.0,<10
+
+# Chuyển đổi Giản thể <-> Phồn thể
+opencc-python-reimplemented>=0.1.7
+
+# Test
+pytest>=8.0
