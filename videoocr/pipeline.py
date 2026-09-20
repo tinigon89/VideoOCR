@@ -37,6 +37,11 @@ class Event:
     progress: float = 0.0           # 0..1 cho file đang chạy
     path: Path | None = None
     cues: int = 0                   # số khối phụ đề, chỉ có ở file_done thành công
+    # Kết quả phần dịch: "" chưa/không dịch, "done", "skipped", "failed".
+    translated: str = ""
+    # Công việc đang chạy: "transcribe" (nhận dạng, có thể kèm dịch) hoặc
+    # "translate" (chỉ dịch lại các .srt sẵn có).
+    stage: str = "transcribe"
 
 
 @dataclass
@@ -116,6 +121,7 @@ def _make_translator(settings: Settings, emit: Emit) -> GeminiTranslator | None:
             keys=settings.gemini_keys,
             model=settings.gemini_model,
             batch_size=settings.translate_batch_size,
+            instructions=settings.translate_prompt,
         )
     except TranslationError as exc:
         emit(Event(kind="log", level="warn",
@@ -256,7 +262,7 @@ def run(
             ))
 
             try:
-                line, cue_count = _process_one(
+                line, cue_count, translated = _process_one(
                     job, index, pending, transcriber, settings, prompt, emit, cancel,
                     translator,
                 )
@@ -276,7 +282,7 @@ def run(
             summary.done.append(job.video)
             emit(Event(
                 kind="file_done", index=index + 1, total=len(todo), path=job.video,
-                level="success", message=line, cues=cue_count,
+                level="success", message=line, cues=cue_count, translated=translated,
             ))
     finally:
         for future in pending.values():
@@ -341,7 +347,7 @@ def translate_existing(
             break
 
         emit(Event(kind="file_start", index=index + 1, total=len(todo),
-                   path=video, message=source.name))
+                   path=video, message=source.name, stage="translate"))
         try:
             count = _translate_srt(source, target, translator, settings, emit, cancel)
         except Cancelled:
@@ -350,12 +356,13 @@ def translate_existing(
         except Exception as exc:
             summary.failed.append((video, str(exc)))
             emit(Event(kind="file_done", index=index + 1, total=len(todo), path=video,
-                       level="error", message=f"Lỗi: {exc}"))
+                       level="error", message=f"Lỗi: {exc}",
+                       stage="translate", translated="failed"))
             continue
 
         summary.done.append(video)
         emit(Event(kind="file_done", index=index + 1, total=len(todo), path=video,
-                   level="success", cues=count,
+                   level="success", cues=count, translated="done", stage="translate",
                    message=f"{target.name} - {count} khối đã dịch"))
 
     emit(Event(kind="log", message=f"Tình trạng key: {translator.key_report()}"))
@@ -378,8 +385,11 @@ def _process_one(
     emit: Emit,
     cancel: threading.Event,
     translator: GeminiTranslator | None = None,
-) -> tuple[str, int]:
-    """Xử lý trọn một video, trả về (dòng tóm tắt để ghi log, số khối phụ đề)."""
+) -> tuple[str, int, str]:
+    """Xử lý trọn một video.
+
+    Trả về (dòng tóm tắt để ghi log, số khối phụ đề, kết quả phần dịch).
+    """
     future = pending.pop(index, None)
     if future is None:
         raise RuntimeError("Không tách được audio.")
@@ -411,23 +421,27 @@ def _process_one(
     emit(Event(kind="file_progress", index=index + 1, path=job.video, progress=1.0))
     line = f"{job.srt.name} - {len(cues)} khối phụ đề ({detected or 'không rõ'})"
 
+    translated = ""
     if translator is not None:
         target = vi_path_for(job.video)
         if has_subtitle(target) and not settings.overwrite:
+            translated = "skipped"
             line += " | đã có bản dịch, bỏ qua"
         else:
             emit(Event(kind="translating", index=index + 1, path=job.video,
                        message=f"Đang dịch {job.srt.name} sang tiếng Việt..."))
             try:
                 _translate_srt(job.srt, target, translator, settings, emit, cancel)
+                translated = "done"
                 line += f" | đã dịch -> {target.name}"
             except Cancelled:
                 raise
             except Exception as exc:
                 # Dịch hỏng thì bản nguyên ngữ vẫn còn nguyên, không coi là
                 # video lỗi - chỉ ghi nhận lại để chạy lại phần dịch sau.
+                translated = "failed"
                 emit(Event(kind="log", level="warn",
                            message=f"Dịch {job.srt.name} không xong: {exc}"))
                 line += " | dịch lỗi"
 
-    return line, len(cues)
+    return line, len(cues), translated

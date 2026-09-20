@@ -46,14 +46,23 @@ mục có hàng trăm video làm dở.
 
 Trong lúc chạy, cột trạng thái đổi theo thời gian thực:
 
-| Trạng thái | Nghĩa |
+Bảng có **hai cột trạng thái tách riêng** — phụ đề gốc và bản dịch không gộp chung:
+
+| Cột **Phụ đề** | Nghĩa |
 |---|---|
-| Chưa có SRT | Chưa có phụ đề, sẽ được xử lý |
-| Đã có SRT | Đã có phụ đề, sẽ bỏ qua (trừ khi bật ghi đè) |
-| Đang xử lý... | Video đang được nhận dạng |
-| Xong · N khối | Đã xuất SRT với N khối phụ đề |
+| Chưa có | Chưa có phụ đề, sẽ được xử lý |
+| Đã có | Đã có phụ đề, sẽ bỏ qua (trừ khi bật ghi đè) |
+| Đang xử lý... | Đang nhận dạng |
+| Xong · N khối | Vừa xuất SRT với N khối phụ đề |
 | Lỗi | Không xử lý được, xem lý do ở nhật ký |
-| Đã có SRT + bản dịch | Có cả phụ đề nguyên ngữ lẫn bản tiếng Việt |
+
+| Cột **Bản dịch** | Nghĩa |
+|---|---|
+| Chưa có | Chưa có file .vi.srt |
+| Đã có | Đã có bản tiếng Việt từ trước |
+| Đang dịch... | Đang gửi sang Gemini |
+| Xong | Vừa dịch xong |
+| Lỗi | Dịch không thành công; bản nguyên ngữ vẫn còn nguyên |
 
 Nút **Quét lại** làm mới danh sách nếu bạn vừa thêm hay xoá file bên ngoài.
 
@@ -72,7 +81,7 @@ ghi đè lựa chọn bạn đã lưu.
 | Mục | Ý nghĩa |
 |---|---|
 | **Ngôn ngữ** | Ngôn ngữ nói trong video. Chọn cố định chính xác hơn để máy tự đoán. |
-| **Model** | `large-v3` chính xác nhất. `medium`/`small` nhanh hơn nhưng kém hơn rõ rệt với tiếng Trung. `distil-large-v3` nhanh gấp đôi nhưng **chỉ hiểu tiếng Anh**. |
+| **Model** | `large-v3` chính xác nhất. `medium`/`small` nhanh hơn nhưng kém hơn rõ rệt với tiếng Trung. `distil-large-v3` nhanh gấp đôi nhưng **chỉ hiểu tiếng Anh**. Ngay dưới có dòng gợi ý model hợp với ngôn ngữ đang chọn, chuyển màu cam khi bạn chọn model không phù hợp. |
 | **Kiểu chữ Trung** | Ép kết quả về giản thể hoặc phồn thể. Whisper trả về lẫn lộn cả hai nên bước này khá cần. |
 | **Compute type** | `float16` cho GPU. Nếu báo hết VRAM thì đổi sang `int8_float16`. |
 | **Batch size** | Càng lớn càng nhanh nhưng càng tốn VRAM. 8 là vừa cho card 11 GB. |
@@ -139,6 +148,24 @@ khoản của bạn dùng được những model nào.
 App tự lọc bỏ những model không dịch chữ được (nhúng vector, sinh ảnh, sinh video,
 đọc giọng nói) và xếp model ổn định lên trước bản preview. Nếu model đang chọn
 không có trong danh sách thật, app tự đổi sang model đầu tiên và báo trong nhật ký.
+
+### Dặn cách xưng hô
+
+Ô **Hướng dẫn dịch** là chỗ đáng bỏ công nhất. Tiếng Trung và tiếng Anh không phân
+biệt vai vế, nên máy dịch phải tự đoán xưng hô — và đoán sai thì cả bộ phim nghe
+lạc giọng. Dặn trước một câu là khác hẳn:
+
+```
+Bối cảnh cổ trang. Dùng lối xưng hô cổ: 'ta - ngươi', 'tại hạ', 'các hạ',
+'muội', 'huynh'. Giữ nguyên các chức danh như hoàng thượng, công tử, tiểu thư.
+```
+
+Dropdown bên phải có sẵn vài mẫu: phim hiện đại (anh/em), phim cổ trang (ta/ngươi),
+phim gia đình, tài liệu thuyết minh. Chọn mẫu rồi sửa lại cho hợp phim của bạn.
+
+Hướng dẫn này được đánh dấu là **ưu tiên cao** trong lời nhắc, nên Gemini sẽ theo nó
+thay vì thói quen dịch mặc định. Các quy tắc giữ nguyên số dòng và mốc thời gian
+vẫn được áp dụng đầy đủ.
 
 ### Mốc thời gian có bị lệch không
 

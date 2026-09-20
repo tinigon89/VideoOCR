@@ -62,9 +62,17 @@ Quy tắc bắt buộc:
 - Giữ nguyên tên riêng, số liệu và các thán từ.
 - Không thêm lời giải thích, không thêm dấu ngoặc chú thích.
 - Nếu một dòng không có gì để dịch, trả lại đúng nội dung gốc.
-
+- Xưng hô phải nhất quán trong suốt cả file.
+{extra}
 Dữ liệu vào (JSON):
 {payload}"""
+
+# Chèn thêm yêu cầu riêng của người dùng. Đặt cuối phần quy tắc và nói rõ là
+# ưu tiên cao, để model không bỏ qua khi nó mâu thuẫn với thói quen dịch mặc định.
+EXTRA_TEMPLATE = """
+Yêu cầu riêng của người dùng (ưu tiên cao hơn thói quen dịch thông thường):
+{instructions}
+"""
 
 RESPONSE_SCHEMA = {
     "type": "OBJECT",
@@ -288,11 +296,13 @@ class GeminiTranslator:
         model: str = DEFAULT_MODEL,
         batch_size: int = 40,
         target_language: str = "tiếng Việt",
+        instructions: str = "",
     ) -> None:
         self.pool = KeyPool(keys)
         self.model = (model or DEFAULT_MODEL).strip()
         self.batch_size = max(1, batch_size)
         self.target_language = target_language
+        self.instructions = (instructions or "").strip()
         self.stats = TranslationStats()
 
         if not len(self.pool):
@@ -370,7 +380,8 @@ class GeminiTranslator:
             [{"id": index, "text": text} for index, text in batch],
             ensure_ascii=False,
         )
-        prompt = PROMPT.format(count=len(batch), payload=payload)
+        extra = EXTRA_TEMPLATE.format(instructions=self.instructions) if self.instructions else ""
+        prompt = PROMPT.format(count=len(batch), payload=payload, extra=extra)
         raw = self._call(prompt, log)
 
         try:

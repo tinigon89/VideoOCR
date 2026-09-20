@@ -34,10 +34,12 @@ class FakeApi:
 
     def __init__(self, script=None):
         self.calls: list[str] = []      # key dùng cho mỗi lần gọi
+        self.bodies: list[dict] = []    # thân yêu cầu, để soi lời nhắc gửi đi
         self.script = script or []      # mỗi phần tử: Exception để ném, hoặc dict để trả
 
     def __call__(self, url, api_key, body):
         self.calls.append(api_key)
+        self.bodies.append(body)
         step = self.script.pop(0) if self.script else None
         if isinstance(step, Exception):
             raise step
@@ -194,6 +196,39 @@ class TestKeyRotation:
         t.translate(["你好"])
         assert "TUYETMAT" not in t.key_report()
         assert "ABCD" in t.key_report()
+
+
+class TestCustomInstructions:
+    def sent_prompt(self, api):
+        return api.bodies[0]["contents"][0]["parts"][0]["text"]
+
+    def test_instructions_reach_the_prompt(self, fake_api):
+        t = GeminiTranslator(keys=["k1"],
+                             instructions="Nam chính xưng 'anh', gọi nữ chính là 'em'.")
+        t.translate(["你好"])
+        assert "Nam chính xưng 'anh'" in self.sent_prompt(fake_api)
+
+    def test_marked_as_high_priority(self, fake_api):
+        t = GeminiTranslator(keys=["k1"], instructions="Dùng ta - ngươi.")
+        t.translate(["你好"])
+        assert "ưu tiên cao" in self.sent_prompt(fake_api)
+
+    def test_no_extra_block_when_empty(self, fake_api):
+        t = GeminiTranslator(keys=["k1"])
+        t.translate(["你好"])
+        assert "Yêu cầu riêng" not in self.sent_prompt(fake_api)
+
+    def test_whitespace_only_counts_as_empty(self, fake_api):
+        t = GeminiTranslator(keys=["k1"], instructions="   \n  ")
+        t.translate(["你好"])
+        assert "Yêu cầu riêng" not in self.sent_prompt(fake_api)
+
+    def test_base_rules_survive_alongside_instructions(self, fake_api):
+        t = GeminiTranslator(keys=["k1"], instructions="Dùng ta - ngươi.")
+        t.translate(["你好", "再见"])
+        prompt = self.sent_prompt(fake_api)
+        assert "ĐÚNG 2 dòng" in prompt
+        assert "Không gộp hai dòng làm một" in prompt
 
 
 class TestSortModels:

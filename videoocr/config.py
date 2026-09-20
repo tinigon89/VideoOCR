@@ -31,6 +31,50 @@ ENGLISH_ONLY_MODELS = {"distil-large-v3", "distil-large-v2", "distil-medium.en",
 
 COMPUTE_TYPES = ["float16", "int8_float16", "int8", "float32"]
 
+# Model nên dùng cho từng ngôn ngữ, kèm lý do. Khoá None là "tự phát hiện".
+MODEL_ADVICE: dict[str | None, tuple[str, str]] = {
+    "zh": ("large-v3",
+           "Tiếng Trung nên để large-v3. Model nhỏ hơn nhầm nhiều chữ đồng âm "
+           "và hay bỏ dấu câu, còn distil-* thì không biết tiếng Trung."),
+    "en": ("large-v3",
+           "large-v3 chính xác nhất. Muốn nhanh gấp đôi mà chất lượng gần ngang "
+           "thì chọn distil-large-v3 - nó chỉ dùng được cho tiếng Anh."),
+    "ja": ("large-v3",
+           "Tiếng Nhật nên để large-v3. Model nhỏ hơn lẫn lộn kanji và cách đọc."),
+    "ko": ("large-v3",
+           "Tiếng Hàn nên để large-v3. Model nhỏ hơn sai nhiều với chữ Hangul."),
+    "vi": ("large-v3",
+           "Whisper nhận tiếng Việt kém hơn tiếng Trung và tiếng Anh, nên đừng "
+           "hạ xuống model nhỏ."),
+    None: ("large-v3",
+           "Tự phát hiện ngôn ngữ cần model lớn mới đoán đúng. distil-* chỉ biết "
+           "tiếng Anh nên không dùng cho chế độ này được."),
+}
+
+_DEFAULT_ADVICE = ("large-v3", "large-v3 là lựa chọn an toàn cho hầu hết ngôn ngữ.")
+
+
+def recommended_model(language: str | None) -> str:
+    return MODEL_ADVICE.get(language, _DEFAULT_ADVICE)[0]
+
+
+def model_advice(language: str | None, model: str) -> tuple[str, str]:
+    """Lời khuyên về model cho ngôn ngữ đang chọn.
+
+    Trả về (câu chữ, mức độ) với mức độ là "hint" hoặc "warn".
+    """
+    best, reason = MODEL_ADVICE.get(language, _DEFAULT_ADVICE)
+
+    if model in ENGLISH_ONLY_MODELS and language != "en":
+        return (f"'{model}' chỉ hiểu tiếng Anh, không dùng được cho ngôn ngữ này. "
+                f"Hãy chọn {best}."), "warn"
+
+    if model != best:
+        return f"Nên dùng {best}: {reason}", "warn"
+
+    return f"Đang dùng đúng model khuyến nghị. {reason}", "hint"
+
+
 CHINESE_VARIANTS: list[tuple[str, str]] = [
     ("Giản thể (简体)", "s"),
     ("Phồn thể (繁體)", "t"),
@@ -45,6 +89,24 @@ DEFAULT_ZH_PROMPT = "以下是普通话的句子。"
 TRANSLATED_SUFFIX = ".vi.srt"
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Gợi ý sẵn cho ô hướng dẫn dịch. Xưng hô là chỗ máy dịch hay sai nhất khi
+# chuyển sang tiếng Việt, vì tiếng Trung và tiếng Anh không phân biệt vai vế.
+PROMPT_PRESETS: list[tuple[str, str]] = [
+    ("(Không dùng hướng dẫn riêng)", ""),
+    ("Phim hiện đại - anh/em",
+     "Bối cảnh hiện đại. Nam chính xưng 'anh', gọi nữ chính là 'em'; nữ chính "
+     "xưng 'em', gọi nam chính là 'anh'. Bạn bè đồng trang lứa xưng 'tôi - cậu'."),
+    ("Phim cổ trang - ta/ngươi",
+     "Bối cảnh cổ trang. Dùng lối xưng hô cổ: 'ta - ngươi', 'tại hạ', 'các hạ', "
+     "'muội', 'huynh'. Giữ nguyên các chức danh như hoàng thượng, công tử, tiểu thư."),
+    ("Phim gia đình",
+     "Xưng hô theo vai vế gia đình: con - bố/mẹ, em - anh/chị, cháu - ông/bà. "
+     "Giữ giọng thân mật, tự nhiên như hội thoại trong nhà."),
+    ("Tài liệu / thuyết minh",
+     "Văn phong tài liệu, trung tính, không xưng hô thân mật. Dùng 'chúng ta' "
+     "khi người dẫn nói với khán giả. Giữ nguyên thuật ngữ chuyên ngành."),
+]
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
@@ -104,6 +166,8 @@ class Settings:
     gemini_keys: list[str] = field(default_factory=list)
     gemini_model: str = DEFAULT_GEMINI_MODEL
     translate_batch_size: int = 40
+    # Hướng dẫn riêng cho người dịch: xưng hô, văn phong, tên riêng giữ nguyên...
+    translate_prompt: str = ""
 
     # Trạng thái gập/mở của các khung, để màn hình thấp còn chỗ cho bảng danh sách.
     panel_options_open: bool = True

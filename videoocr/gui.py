@@ -23,8 +23,10 @@ from .config import (
     ENGLISH_ONLY_MODELS,
     LANGUAGES,
     MODELS,
+    PROMPT_PRESETS,
     Settings,
     default_model_dir,
+    model_advice,
     resolve_model_dir,
 )
 from .gpu import gpu_name
@@ -48,9 +50,11 @@ STATUS_COLORS = {
     "error": "#c02020",
 }
 
-STATUS_TODO = "Chưa có SRT"
-STATUS_HAVE = "Đã có SRT"
-STATUS_HAVE_VI = "Đã có SRT + bản dịch"
+# Cột "Phụ đề" và cột "Bản dịch" giữ trạng thái riêng, không gộp chung nữa.
+SRT_TODO = "Chưa có"
+SRT_HAVE = "Đã có"
+VI_TODO = "Chưa có"
+VI_HAVE = "Đã có"
 
 HINT_COLOR = "#666666"
 
@@ -124,8 +128,10 @@ class App(ttk.Frame):
         self.scan_generation = 0
 
         # Trạng thái bảng. Khoá là đường dẫn tuyệt đối dạng chuỗi.
+        # Mỗi file giữ hai trạng thái riêng: phụ đề gốc và bản dịch.
         self.entries: list[Entry] = []
-        self.status: dict[str, tuple[str, str]] = {}   # khoá -> (chữ, tag màu)
+        self.srt_state: dict[str, tuple[str, str]] = {}   # khoá -> (chữ, tag màu)
+        self.vi_state: dict[str, tuple[str, str]] = {}
         self.has_srt: dict[str, bool] = {}
 
         # Nguồn sự thật của danh sách key; ô nhập có thể đang hiện dạng che.
@@ -200,6 +206,9 @@ class App(ttk.Frame):
         self.var_model = tk.StringVar()
         self._combo(frame, 0, 2, "Model:", self.var_model, MODELS, self._on_model_change)
 
+        self.lbl_advice = self._hint(frame, "")
+        self.lbl_advice.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+
         self.var_variant = tk.StringVar()
         self._combo(frame, 1, 0, "Kiểu chữ Trung:", self.var_variant,
                     [label for label, _ in CHINESE_VARIANTS])
@@ -270,8 +279,34 @@ class App(ttk.Frame):
                           "quota - muốn cộng dồn thì mỗi key phải khác project."
                    ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=(3, 0))
 
+        ttk.Label(frame, text="Hướng dẫn dịch:").grid(
+            row=3, column=0, sticky="nw", pady=(8, 0))
+        prompt_wrap = ttk.Frame(frame)
+        prompt_wrap.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        prompt_wrap.columnconfigure(0, weight=1)
+
+        self.prompt_box = tk.Text(prompt_wrap, height=3, wrap="word")
+        self.prompt_box.grid(row=0, column=0, sticky="ew")
+        pscroll = ttk.Scrollbar(prompt_wrap, orient="vertical",
+                                command=self.prompt_box.yview)
+        pscroll.grid(row=0, column=1, sticky="ns")
+        self.prompt_box.configure(yscrollcommand=pscroll.set)
+
+        self.var_preset = tk.StringVar(value=PROMPT_PRESETS[0][0])
+        preset = ttk.Combobox(prompt_wrap, textvariable=self.var_preset, width=24,
+                              state="readonly",
+                              values=[label for label, _ in PROMPT_PRESETS])
+        preset.grid(row=0, column=2, sticky="n", padx=(6, 0))
+        preset.bind("<<ComboboxSelected>>", self._apply_preset)
+
+        self._hint(frame, "Dặn người dịch về xưng hô và văn phong - chỗ máy dịch "
+                          "hay sai nhất, vì tiếng Trung và tiếng Anh không phân biệt "
+                          "vai vế như tiếng Việt. Chọn mẫu bên phải rồi sửa lại cho "
+                          "hợp phim của bạn."
+                   ).grid(row=4, column=1, columnspan=2, sticky="ew", pady=(3, 0))
+
         bottom = ttk.Frame(frame)
-        bottom.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        bottom.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         bottom.columnconfigure(2, weight=1)
 
         ttk.Label(bottom, text="Model Gemini:").grid(row=0, column=0, sticky="w", padx=(0, 6))
@@ -320,14 +355,16 @@ class App(ttk.Frame):
 
         # height thấp để bảng không đòi nhiều chỗ trên màn hình bé; weight trong
         # PanedWindow sẽ cho nó nở ra khi còn chỗ.
-        columns = ("name", "size", "status")
+        columns = ("name", "size", "srt", "vi")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=6)
         self.tree.heading("name", text="Tên file")
         self.tree.heading("size", text="Dung lượng")
-        self.tree.heading("status", text="Trạng thái")
-        self.tree.column("name", width=380, anchor="w")
-        self.tree.column("size", width=100, anchor="e", stretch=False)
-        self.tree.column("status", width=200, anchor="w", stretch=False)
+        self.tree.heading("srt", text="Phụ đề")
+        self.tree.heading("vi", text="Bản dịch")
+        self.tree.column("name", width=320, anchor="w")
+        self.tree.column("size", width=95, anchor="e", stretch=False)
+        self.tree.column("srt", width=150, anchor="w", stretch=False)
+        self.tree.column("vi", width=130, anchor="w", stretch=False)
         self.tree.grid(row=1, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -424,25 +461,40 @@ class App(ttk.Frame):
 
         if isinstance(result, Exception):
             self.entries = []
-            self.status.clear()
+            self.srt_state.clear()
+            self.vi_state.clear()
             self.has_srt.clear()
             self._render_tree()
             self.var_summary.set(f"Không quét được: {result}")
             return
 
         self.entries = result
-        self.status = {}
+        self.srt_state = {}
+        self.vi_state = {}
         self.has_srt = {}
         for entry in result:
             key = str(entry.video)
             self.has_srt[key] = entry.has_srt
-            if entry.has_srt:
-                label = STATUS_HAVE_VI if entry.has_vi else STATUS_HAVE
-                self.status[key] = (label, "have")
-            else:
-                self.status[key] = (STATUS_TODO, "todo")
+            self.srt_state[key] = ((SRT_HAVE, "have") if entry.has_srt
+                                   else (SRT_TODO, "todo"))
+            self.vi_state[key] = ((VI_HAVE, "have") if entry.has_vi
+                                  else (VI_TODO, "todo"))
 
         self._render_tree()
+
+    @staticmethod
+    def _row_tag(srt_tag: str, vi_tag: str) -> str:
+        """Treeview chỉ tô màu được cả dòng, nên lấy trạng thái đáng chú ý nhất."""
+        for tag in ("error", "running", "todo"):
+            if srt_tag == tag or vi_tag == tag:
+                return tag
+        return "have"
+
+    def _row_values(self, entry: Entry) -> tuple:
+        key = str(entry.video)
+        srt_text, _ = self.srt_state.get(key, (SRT_TODO, "todo"))
+        vi_text, _ = self.vi_state.get(key, (VI_TODO, "todo"))
+        return (entry.relative, format_size(entry.size), srt_text, vi_text)
 
     def _render_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -452,11 +504,12 @@ class App(ttk.Frame):
             key = str(entry.video)
             if only_todo and self.has_srt.get(key, False):
                 continue
-            text, tag = self.status.get(key, (STATUS_TODO, "todo"))
+            _, srt_tag = self.srt_state.get(key, (SRT_TODO, "todo"))
+            _, vi_tag = self.vi_state.get(key, (VI_TODO, "todo"))
             self.tree.insert(
                 "", "end", iid=key,
-                values=(entry.relative, format_size(entry.size), text),
-                tags=(tag,),
+                values=self._row_values(entry),
+                tags=(self._row_tag(srt_tag, vi_tag),),
             )
 
         self._update_summary()
@@ -468,29 +521,38 @@ class App(ttk.Frame):
 
         total_size = sum(e.size for e in self.entries)
         done = sum(1 for e in self.entries if self.has_srt.get(str(e.video), False))
-        missing = len(self.entries) - done
+        dubbed = sum(1 for e in self.entries
+                     if self.vi_state.get(str(e.video), ("", ""))[0] != VI_TODO)
         self.var_summary.set(
             f"{len(self.entries)} video · {format_size(total_size)} · "
-            f"{done} đã có SRT · {missing} chưa có"
+            f"{done} có phụ đề · {len(self.entries) - done} chưa có · "
+            f"{dubbed} đã dịch"
         )
 
-    def _set_status(self, path: Path | None, text: str, tag: str,
-                    has_srt: bool | None = None) -> None:
+    def _set_state(self, path: Path | None, column: str, text: str, tag: str,
+                   has_srt: bool | None = None) -> None:
+        """Cập nhật một ô trạng thái. ``column`` là "srt" hoặc "vi"."""
         if path is None:
             return
         key = str(path)
-        self.status[key] = (text, tag)
+        store = self.srt_state if column == "srt" else self.vi_state
+        store[key] = (text, tag)
         if has_srt is not None:
             self.has_srt[key] = has_srt
 
         if self.tree.exists(key):
+            _, srt_tag = self.srt_state.get(key, (SRT_TODO, "todo"))
+            _, vi_tag = self.vi_state.get(key, (VI_TODO, "todo"))
+            row_tag = self._row_tag(srt_tag, vi_tag)
+
             # Ẩn dòng đã xong nếu đang bật bộ lọc, ngược lại chỉ cập nhật tại chỗ.
-            if self.var_only_todo.get() and self.has_srt.get(key, False) and tag != "running":
+            if self.var_only_todo.get() and self.has_srt.get(key, False) \
+                    and row_tag not in ("running", "error"):
                 self.tree.delete(key)
                 self._update_summary()
                 return
-            self.tree.set(key, "status", text)
-            self.tree.item(key, tags=(tag,))
+            self.tree.set(key, column, text)
+            self.tree.item(key, tags=(row_tag,))
             self.tree.see(key)
         self._update_summary()
 
@@ -591,6 +653,9 @@ class App(ttk.Frame):
         self.var_translate.set(s.translate_enabled)
         self.var_gemini_model.set(s.gemini_model or DEFAULT_GEMINI_MODEL)
 
+        self.prompt_box.delete("1.0", "end")
+        self.prompt_box.insert("1.0", s.translate_prompt)
+
         self._keys = list(s.gemini_keys)
         # Có key sẵn thì che ngay, chưa có thì để mở cho dễ dán vào.
         self._show_keys(s.hide_keys and bool(self._keys))
@@ -603,6 +668,7 @@ class App(ttk.Frame):
 
         self.panel_options.set_expanded(s.panel_options_open, notify=False)
         self.panel_translate.set_expanded(s.panel_translate_open, notify=False)
+        self._refresh_advice()
 
     def _collect_settings(self) -> Settings:
         s = self.settings
@@ -618,6 +684,7 @@ class App(ttk.Frame):
         s.translate_enabled = self.var_translate.get()
         s.gemini_keys = self._read_keys()
         s.gemini_model = self.var_gemini_model.get().strip() or DEFAULT_GEMINI_MODEL
+        s.translate_prompt = self.prompt_box.get("1.0", "end").strip()
         s.language = dict(LANGUAGES).get(self.var_language.get())
         s.chinese_variant = dict(CHINESE_VARIANTS).get(self.var_variant.get(), "s")
         s.panel_options_open = self.panel_options.expanded
@@ -699,6 +766,7 @@ class App(ttk.Frame):
         if code != "en" and self.var_model.get() in ENGLISH_ONLY_MODELS:
             self.var_model.set("large-v3")
             self._log("Model distil-* chỉ hiểu tiếng Anh, đã chuyển về large-v3.", "warn")
+        self._refresh_advice()
 
     def _on_model_change(self, _event=None) -> None:
         code = dict(LANGUAGES).get(self.var_language.get())
@@ -706,6 +774,22 @@ class App(ttk.Frame):
             self.var_language.set(next(
                 label for label, lang in LANGUAGES if lang == "en"))
             self._log("Model này chỉ hiểu tiếng Anh, đã chuyển ngôn ngữ sang English.", "warn")
+        self._refresh_advice()
+
+    def _apply_preset(self, _event=None) -> None:
+        """Đổ mẫu hướng dẫn vào ô để người dùng sửa tiếp."""
+        text = dict(PROMPT_PRESETS).get(self.var_preset.get(), "")
+        self.prompt_box.delete("1.0", "end")
+        self.prompt_box.insert("1.0", text)
+
+    def _refresh_advice(self) -> None:
+        """Cập nhật câu gợi ý model cho ngôn ngữ đang chọn."""
+        language = dict(LANGUAGES).get(self.var_language.get())
+        text, level = model_advice(language, self.var_model.get())
+        self.lbl_advice.configure(
+            text=text,
+            foreground=LEVEL_COLORS["warn"] if level == "warn" else HINT_COLOR,
+        )
 
     def _busy(self, busy: bool) -> None:
         self.btn_start.configure(state="disabled" if busy else "normal")
@@ -783,13 +867,16 @@ class App(ttk.Frame):
         elif event.kind == "file_start":
             self.bar_file["value"] = 0
             self.var_status.set(f"[{event.index}/{event.total}] {event.message}")
-            self._set_status(event.path, "Đang xử lý...", "running")
+            if event.stage == "translate":
+                self._set_state(event.path, "vi", "Đang dịch...", "running")
+            else:
+                self._set_state(event.path, "srt", "Đang xử lý...", "running")
 
         elif event.kind == "file_progress":
             self.bar_file["value"] = event.progress * 100
 
         elif event.kind == "translating":
-            self._set_status(event.path, "Đang dịch...", "running")
+            self._set_state(event.path, "vi", "Đang dịch...", "running")
             self._log(event.message, event.level)
 
         elif event.kind == "keys_checked":
@@ -799,12 +886,7 @@ class App(ttk.Frame):
             self.bar_file["value"] = 100
             if event.total:
                 self.bar_total["value"] = event.index / event.total * 100
-            if event.level == "error":
-                self._set_status(event.path, "Lỗi", "error", has_srt=False)
-            else:
-                suffix = " + dịch" if "đã dịch" in event.message else ""
-                self._set_status(event.path, f"Xong · {event.cues} khối{suffix}",
-                                 "have", has_srt=True)
+            self._apply_file_done(event)
             self._log(f"[{event.index}/{event.total}] {event.message}", event.level)
 
         elif event.kind == "finished":
@@ -816,6 +898,32 @@ class App(ttk.Frame):
 
         else:
             self._log(event.message, event.level)
+
+    # Kết quả phần dịch hiển thị ở cột "Bản dịch".
+    _VI_OUTCOMES = {
+        "done": ("Xong", "have"),
+        "skipped": ("Đã có", "have"),
+        "failed": ("Lỗi", "error"),
+    }
+
+    def _apply_file_done(self, event: pipeline.Event) -> None:
+        """Đổ kết quả một file vào đúng hai cột trạng thái."""
+        only_translating = event.stage == "translate"
+
+        if event.level == "error":
+            column = "vi" if only_translating else "srt"
+            self._set_state(event.path, column, "Lỗi", "error",
+                            has_srt=None if only_translating else False)
+            return
+
+        # Nút "Dịch các SRT đã có" không nhận dạng lại, đừng đụng vào cột phụ đề.
+        if not only_translating:
+            self._set_state(event.path, "srt", f"Xong · {event.cues} khối",
+                            "have", has_srt=True)
+
+        if event.translated in self._VI_OUTCOMES:
+            text, tag = self._VI_OUTCOMES[event.translated]
+            self._set_state(event.path, "vi", text, tag)
 
     def _log(self, message: str, level: str = "info") -> None:
         self.log.configure(state="normal")
