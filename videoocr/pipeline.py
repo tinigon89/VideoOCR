@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -21,6 +22,12 @@ from .translator import GeminiTranslator, TranslationError
 # SRT ghi kèm BOM để PotPlayer/MPC-HC trên Windows không đoán nhầm bảng mã
 # và làm vỡ font chữ Trung.
 SRT_ENCODING = "utf-8-sig"
+
+# Số lần thử đổi tên file và nhịp nghỉ giữa các lần, để vượt qua khoảng thời
+# gian phần mềm diệt virus đang giữ khoá file vừa ghi. Tổng cộng chờ tối đa
+# khoảng 6 giây trước khi chuyển sang đường lùi.
+REPLACE_ATTEMPTS = 6
+REPLACE_DELAY = 0.3
 
 
 class Cancelled(Exception):
@@ -80,15 +87,77 @@ def _prompt_for(settings: Settings) -> str | None:
     return prompt if prompt != DEFAULT_ZH_PROMPT else None
 
 
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Đổi tên file, thử lại khi bị khoá tạm.
+
+    Trên Windows, phần mềm diệt virus quét file ngay khi nó vừa được ghi xong và
+    giữ khoá trong tích tắc. Nếu ``os.replace`` rơi đúng khoảnh khắc đó thì văng
+    WinError 32, trong khi chỉ cần chờ một nhịp là qua.
+    """
+    last: OSError | None = None
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            source.replace(target)
+            return
+        except PermissionError as exc:
+            last = exc
+            time.sleep(REPLACE_DELAY * (attempt + 1))
+    assert last is not None
+    raise last
+
+
 def _write_srt(cues: list[Cue], target: Path) -> None:
     """Ghi vào file tạm rồi mới đổi tên.
 
     Nếu bị tắt giữa chừng, lần chạy sau sẽ không thấy một file SRT cụt và
     tưởng nhầm là đã xong.
     """
+    text = render_srt(cues)
     partial = target.with_suffix(target.suffix + ".part")
-    partial.write_text(render_srt(cues), encoding=SRT_ENCODING)
-    partial.replace(target)
+    partial.write_text(text, encoding=SRT_ENCODING)
+
+    try:
+        _replace_with_retry(partial, target)
+        return
+    except PermissionError as exc:
+        locked = exc
+
+    # Chờ mãi vẫn bị khoá thì ghi thẳng vào đích. Mất tính nguyên tử của bước
+    # đổi tên, nhưng đổi lại không phí cả tiếng đồng hồ nhận dạng chỉ vì một
+    # file bị giữ trong vài giây.
+    try:
+        target.write_text(text, encoding=SRT_ENCODING)
+    except OSError:
+        raise RuntimeError(
+            f"Không ghi được {target.name}: file đang bị khoá, thường là do phần "
+            f"mềm diệt virus hoặc ứng dụng đồng bộ. Kết quả vẫn nằm nguyên ở "
+            f"{partial.name}, đổi tên thành {target.name} là dùng được."
+        ) from locked
+
+    partial.unlink(missing_ok=True)
+
+
+def recover_partials(root: Path, recursive: bool = True) -> list[Path]:
+    """Cứu các file .part còn sót lại từ lần chạy trước bị khoá.
+
+    Trả về danh sách file đã cứu được.
+    """
+    rescued: list[Path] = []
+    pattern = "**/*.part" if recursive else "*.part"
+
+    for partial in sorted(root.glob(pattern)):
+        target = partial.with_suffix("")
+        if not partial.is_file() or partial.stat().st_size == 0:
+            continue
+        if target.exists():
+            continue  # đích đã có rồi, .part chỉ là rác
+        try:
+            _replace_with_retry(partial, target)
+        except OSError:
+            continue
+        rescued.append(target)
+
+    return rescued
 
 
 def _build_subtitle(words, language: str | None, settings: Settings) -> list[Cue]:
@@ -179,6 +248,14 @@ def run(
     root = Path(settings.input_dir).expanduser()
     if not root.is_dir():
         raise NotADirectoryError(f"Không tìm thấy thư mục: {root}")
+
+    rescued = recover_partials(root, recursive=settings.recursive)
+    if rescued:
+        emit(Event(kind="log", level="success", message=(
+            f"Cứu được {len(rescued)} file dở từ lần chạy trước: "
+            + ", ".join(p.name for p in rescued[:5])
+            + (" ..." if len(rescued) > 5 else "")
+        )))
 
     videos = find_videos(root, recursive=settings.recursive)
     todo, skipped = plan_jobs(videos, overwrite=settings.overwrite)

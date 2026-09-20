@@ -115,6 +115,110 @@ class TestBuildSubtitle:
         assert pipeline._build_subtitle(words, "zh", Settings()) == []
 
 
+class TestWriteSrtWhenLocked:
+    """Windows: phần mềm diệt virus khoá file vừa ghi, os.replace văng WinError 32."""
+
+    def cue(self):
+        from videoocr.subtitle import Cue
+        return [Cue(0.0, 1.0, "你好")]
+
+    def test_retries_until_the_lock_clears(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        calls = {"n": 0}
+        real = Path.replace
+
+        def flaky(self, target):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(32, "file dang bi khoa")
+            return real(self, target)
+
+        monkeypatch.setattr(Path, "replace", flaky)
+        monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+
+        target = tmp_path / "phim.srt"
+        pipeline._write_srt(self.cue(), target)
+        assert target.read_text(encoding="utf-8-sig").startswith("1\n")
+        assert calls["n"] == 3
+
+    def test_falls_back_to_direct_write(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        def always_locked(self, target):
+            raise PermissionError(32, "file dang bi khoa")
+
+        monkeypatch.setattr(Path, "replace", always_locked)
+        monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+
+        target = tmp_path / "phim.srt"
+        pipeline._write_srt(self.cue(), target)
+        # Công nhận dạng không được phép mất chỉ vì đổi tên hỏng.
+        assert "你好" in target.read_text(encoding="utf-8-sig")
+        assert not (tmp_path / "phim.srt.part").exists()
+
+    def test_error_says_where_the_result_is(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        def always_locked(self, target):
+            raise PermissionError(32, "file dang bi khoa")
+
+        def cannot_write(self, data, encoding=None):
+            if self.name.endswith(".part"):
+                return len(data)
+            raise PermissionError(32, "dich cung bi khoa")
+
+        monkeypatch.setattr(Path, "replace", always_locked)
+        monkeypatch.setattr(Path, "write_text", cannot_write)
+        monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+
+        with pytest.raises(RuntimeError) as info:
+            pipeline._write_srt(self.cue(), tmp_path / "phim.srt")
+        assert "phim.srt.part" in str(info.value)
+
+
+class TestRecoverPartials:
+    def test_renames_leftover_part_file(self, tmp_path):
+        (tmp_path / "2.srt.part").write_text("1\n", encoding="utf-8")
+        rescued = pipeline.recover_partials(tmp_path)
+        assert [p.name for p in rescued] == ["2.srt"]
+        assert (tmp_path / "2.srt").exists()
+        assert not (tmp_path / "2.srt.part").exists()
+
+    def test_leaves_part_alone_when_target_exists(self, tmp_path):
+        (tmp_path / "2.srt").write_text("that", encoding="utf-8")
+        (tmp_path / "2.srt.part").write_text("do", encoding="utf-8")
+        assert pipeline.recover_partials(tmp_path) == []
+        assert (tmp_path / "2.srt").read_text(encoding="utf-8") == "that"
+
+    def test_ignores_empty_part_file(self, tmp_path):
+        (tmp_path / "2.srt.part").write_bytes(b"")
+        assert pipeline.recover_partials(tmp_path) == []
+
+    def test_reaches_into_subfolders(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "3.srt.part").write_text("1\n", encoding="utf-8")
+        assert len(pipeline.recover_partials(tmp_path)) == 1
+
+    def test_skips_subfolders_when_not_recursive(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "3.srt.part").write_text("1\n", encoding="utf-8")
+        assert pipeline.recover_partials(tmp_path, recursive=False) == []
+
+    def test_nothing_to_do(self, tmp_path):
+        assert pipeline.recover_partials(tmp_path) == []
+
+    def test_run_rescues_before_processing(self, stub_environment, folder):
+        (folder / "phim1.srt.part").write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\ncu\n", encoding="utf-8")
+        summary = pipeline.run(make_settings(folder))
+        assert (folder / "phim1.srt").exists()
+        # Đã cứu được nên coi như đã có phụ đề, không nhận dạng lại nữa.
+        assert [p.name for p in summary.skipped] == ["phim1.mp4"]
+
+
 class TestWriteSrt:
     def test_writes_utf8_with_bom(self, tmp_path):
         from videoocr.subtitle import Cue

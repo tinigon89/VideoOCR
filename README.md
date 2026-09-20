@@ -231,6 +231,18 @@ phụ đề YouTube. Bật *Lọc câu rác* và *Lọc khoảng lặng*.
 **Một video bị lỗi.** Loạt vẫn chạy tiếp, video lỗi được ghi vào nhật ký và bỏ qua.
 Chạy lại lần nữa thì chỉ những video còn thiếu phụ đề mới được xử lý.
 
+**Lỗi `WinError 32 - file đang được tiến trình khác sử dụng`.** App ghi phụ đề ra
+file `.srt.part` rồi mới đổi tên thành `.srt`. Trên Windows, phần mềm diệt virus
+quét file ngay khi nó vừa ghi xong và giữ khoá trong tích tắc — rơi đúng khoảnh
+khắc đó thì bước đổi tên hỏng.
+
+App tự thử lại nhiều nhịp trong khoảng 6 giây, và nếu vẫn không được thì ghi thẳng
+vào file đích thay vì bỏ cuộc. Ngoài ra mỗi lần chạy nó còn tự tìm các file `.part`
+còn sót từ lần trước và đổi tên lại giúp bạn, nên công nhận dạng không bị mất.
+
+Nếu vẫn gặp thường xuyên, thêm thư mục video vào danh sách loại trừ của Windows
+Security (Virus & threat protection → Manage settings → Exclusions) sẽ dứt điểm.
+
 ---
 
 ## Cấu trúc mã nguồn
