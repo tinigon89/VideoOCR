@@ -105,6 +105,11 @@ class Settings:
     gemini_model: str = DEFAULT_GEMINI_MODEL
     translate_batch_size: int = 40
 
+    # Trạng thái gập/mở của các khung, để màn hình thấp còn chỗ cho bảng danh sách.
+    panel_options_open: bool = True
+    panel_translate_open: bool = True
+    hide_keys: bool = True
+
     def save(self, path: Path | None = None) -> None:
         target = path or settings_path()
         try:

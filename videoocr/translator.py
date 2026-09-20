@@ -26,13 +26,24 @@ from .subtitle import join_display_lines
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-2.5-flash"
 
-# Gợi ý cho dropdown; nút "Kiểm tra key" sẽ hỏi API danh sách thật.
+# Chỉ là gợi ý ban đầu cho dropdown. Google đổi danh sách model liên tục nên
+# đừng tin vào danh sách chết này - bấm nút lấy danh sách để hỏi thẳng API.
 SUGGESTED_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
-    "gemini-2.0-flash",
 ]
+
+# Những model tuy hỗ trợ generateContent nhưng không dùng để dịch chữ được:
+# nhúng vector, sinh ảnh, sinh video, đọc/nghe giọng nói.
+_NOT_FOR_TEXT = (
+    "embedding", "aqa", "imagen", "veo", "tts",
+    "image-generation", "native-audio", "live-", "-live",
+    "robotics", "computer-use",
+)
+
+# Bản preview/exp hay đổi và hạn mức chặt hơn, nên xếp xuống dưới bản ổn định.
+_UNSTABLE = ("preview", "exp", "latest", "-002", "-001")
 
 REQUEST_TIMEOUT = 120
 RATE_LIMIT_COOLDOWN = 60.0     # 429: nghỉ key này một phút rồi quay lại
@@ -195,6 +206,52 @@ def list_models(api_key: str) -> list[str]:
         name = str(item.get("name", ""))
         names.append(name.removeprefix("models/"))
     return sorted(names)
+
+
+def sort_models(names: list[str]) -> list[str]:
+    """Xếp model dễ chọn: gemini trước, bản ổn định trước, số hiệu mới trước."""
+    buckets: dict[tuple[int, int], list[str]] = {}
+    for name in names:
+        family = 0 if name.startswith("gemini") else 1
+        unstable = 1 if any(tag in name for tag in _UNSTABLE) else 0
+        buckets.setdefault((family, unstable), []).append(name)
+
+    ordered: list[str] = []
+    for key in sorted(buckets):
+        # Sắp giảm dần để gemini-3 đứng trên gemini-2.5.
+        ordered.extend(sorted(buckets[key], reverse=True))
+    return ordered
+
+
+def translation_models(api_key: str) -> list[str]:
+    """Danh sách model dùng dịch được, đã lọc và xếp thứ tự."""
+    usable = [
+        name for name in list_models(api_key)
+        if not any(hint in name.lower() for hint in _NOT_FOR_TEXT)
+    ]
+    return sort_models(usable)
+
+
+def fetch_models(keys: list[str]) -> tuple[list[str], str]:
+    """Thử lần lượt từng key cho tới khi lấy được danh sách.
+
+    Trả về (danh sách model, lời nhắn để ghi nhật ký).
+    """
+    if not keys:
+        raise TranslationError("Chưa nhập API key nào.")
+
+    problems = []
+    for position, key in enumerate(keys, start=1):
+        try:
+            models = translation_models(key)
+        except TranslationError as exc:
+            tail = key[-4:] if len(key) >= 4 else "????"
+            problems.append(f"key #{position} (...{tail}): {exc}")
+            continue
+        if models:
+            return models, f"Lấy được {len(models)} model từ key #{position}."
+
+    raise TranslationError("Không key nào lấy được danh sách. " + " | ".join(problems))
 
 
 def check_key(api_key: str) -> tuple[bool, str]:

@@ -10,6 +10,9 @@ from videoocr.translator import (
     GeminiTranslator,
     KeyPool,
     TranslationError,
+    fetch_models,
+    sort_models,
+    translation_models,
 )
 
 
@@ -191,6 +194,84 @@ class TestKeyRotation:
         t.translate(["你好"])
         assert "TUYETMAT" not in t.key_report()
         assert "ABCD" in t.key_report()
+
+
+class TestSortModels:
+    def test_gemini_comes_before_other_families(self):
+        result = sort_models(["gemma-3-27b-it", "gemini-2.5-flash"])
+        assert result[0] == "gemini-2.5-flash"
+
+    def test_newer_version_first(self):
+        result = sort_models(["gemini-2.0-flash", "gemini-3-flash", "gemini-2.5-flash"])
+        assert result[0] == "gemini-3-flash"
+
+    def test_stable_before_preview(self):
+        result = sort_models(["gemini-2.5-flash-preview-09-2025", "gemini-2.5-flash"])
+        assert result[0] == "gemini-2.5-flash"
+
+    def test_keeps_every_model(self):
+        names = ["gemini-2.5-flash", "gemma-3-27b-it", "gemini-2.5-pro-preview"]
+        assert sorted(sort_models(names)) == sorted(names)
+
+    def test_empty_list(self):
+        assert sort_models([]) == []
+
+
+class TestTranslationModels:
+    def test_drops_models_that_cannot_translate(self, monkeypatch):
+        monkeypatch.setattr("videoocr.translator.list_models", lambda key: [
+            "gemini-2.5-flash",
+            "gemini-embedding-001",
+            "imagen-4.0-generate-001",
+            "veo-3.0-generate-preview",
+            "gemini-2.5-flash-native-audio",
+            "gemini-2.5-flash-preview-tts",
+        ])
+        assert translation_models("k") == ["gemini-2.5-flash"]
+
+    def test_keeps_ordinary_text_models(self, monkeypatch):
+        monkeypatch.setattr("videoocr.translator.list_models", lambda key: [
+            "gemini-2.5-flash", "gemini-2.5-pro", "gemma-3-27b-it",
+        ])
+        assert len(translation_models("k")) == 3
+
+
+class TestFetchModels:
+    def test_uses_the_first_working_key(self, monkeypatch):
+        seen = []
+
+        def fake(key):
+            seen.append(key)
+            if key == "bad":
+                raise TranslationError("key hỏng")
+            return ["gemini-2.5-flash"]
+
+        monkeypatch.setattr("videoocr.translator.translation_models", fake)
+        models, note = fetch_models(["bad", "good"])
+        assert models == ["gemini-2.5-flash"]
+        assert seen == ["bad", "good"]
+        assert "key #2" in note
+
+    def test_raises_when_no_key_works(self, monkeypatch):
+        def fake(key):
+            raise TranslationError("key hỏng")
+
+        monkeypatch.setattr("videoocr.translator.translation_models", fake)
+        with pytest.raises(TranslationError):
+            fetch_models(["a", "b"])
+
+    def test_empty_key_list_raises(self):
+        with pytest.raises(TranslationError):
+            fetch_models([])
+
+    def test_error_message_does_not_leak_keys(self, monkeypatch):
+        def fake(key):
+            raise TranslationError("key hỏng")
+
+        monkeypatch.setattr("videoocr.translator.translation_models", fake)
+        with pytest.raises(TranslationError) as info:
+            fetch_models(["AIzaSyTUYETMAT1234"])
+        assert "TUYETMAT" not in str(info.value)
 
 
 class TestBadResponses:

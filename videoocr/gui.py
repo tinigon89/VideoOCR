@@ -2,6 +2,9 @@
 
 Phần xử lý nặng chạy ở thread riêng và đẩy sự kiện qua queue; cửa sổ chỉ đọc
 queue định kỳ. Nhờ vậy giao diện không bị đơ trong lúc nhận dạng.
+
+Bố cục nhắm tới màn hình thấp: hai khung tuỳ chọn gập lại được, còn bảng danh
+sách và nhật ký nằm trong một vùng kéo chia đôi được bằng chuột.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from .config import (
 )
 from .gpu import gpu_name
 from .scanner import Entry, format_size, scan_entries
-from .translator import SUGGESTED_MODELS, check_key
+from .translator import SUGGESTED_MODELS, check_key, fetch_models
 
 POLL_INTERVAL_MS = 100
 
@@ -49,15 +52,71 @@ STATUS_TODO = "Chưa có SRT"
 STATUS_HAVE = "Đã có SRT"
 STATUS_HAVE_VI = "Đã có SRT + bản dịch"
 
+HINT_COLOR = "#666666"
+
+# Chiều cao tối thiểu dành cho vùng bảng + nhật ký, tính bằng pixel.
+LIST_MIN_HEIGHT = 190
+
+
+def mask_key(key: str) -> str:
+    """AIzaSyDhE2...RKGI1R1s -> AIza••••••••1R1s"""
+    if len(key) <= 8:
+        return "•" * len(key)
+    return key[:4] + "•" * min(len(key) - 8, 24) + key[-4:]
+
+
+class Collapsible(ttk.Frame):
+    """Khung có tiêu đề bấm được để gập/mở phần thân."""
+
+    def __init__(self, master, title: str, expanded: bool = True, on_toggle=None) -> None:
+        super().__init__(master)
+        self.columnconfigure(0, weight=1)
+        self.title = title
+        self._expanded = expanded
+        self._on_toggle = on_toggle
+
+        self.header = ttk.Button(self, style="Section.TButton", command=self.toggle)
+        self.header.grid(row=0, column=0, sticky="ew")
+
+        self.body = ttk.Frame(self, padding=(12, 6, 4, 8))
+        self.body.grid(row=1, column=0, sticky="ew")
+
+        self._sync()
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
+
+    def toggle(self) -> None:
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, value: bool, notify: bool = True) -> None:
+        """``notify=False`` dùng cho lúc app tự gập để vừa màn hình - không
+        ghi đè lựa chọn người dùng đã lưu."""
+        if value == self._expanded:
+            return
+        self._expanded = value
+        self._sync()
+        if notify and self._on_toggle is not None:
+            self._on_toggle()
+
+    def _sync(self) -> None:
+        self.header.configure(text=f"  {'▼' if self._expanded else '▶'}   {self.title}")
+        if self._expanded:
+            self.body.grid()
+        else:
+            self.body.grid_remove()
+
 
 class App(ttk.Frame):
     def __init__(self, master: tk.Tk) -> None:
-        super().__init__(master, padding=12)
+        super().__init__(master, padding=10)
         self.master = master
         self.settings = Settings.load()
 
         self.events: queue.Queue[pipeline.Event] = queue.Queue()
         self.scan_results: queue.Queue[tuple[int, list[Entry] | Exception]] = queue.Queue()
+        self.model_results: queue.Queue[tuple[list[str], str] | Exception] = queue.Queue()
         self.cancel = threading.Event()
         self.worker: threading.Thread | None = None
         # Mỗi lần quét mang một số thứ tự; kết quả của lần quét cũ bị bỏ qua.
@@ -69,10 +128,20 @@ class App(ttk.Frame):
         self.status: dict[str, tuple[str, str]] = {}   # khoá -> (chữ, tag màu)
         self.has_srt: dict[str, bool] = {}
 
+        # Nguồn sự thật của danh sách key; ô nhập có thể đang hiện dạng che.
+        self._keys: list[str] = []
+        self.keys_hidden = True
+
         self._build()
         self._apply_settings()
         self.pack(fill="both", expand=True)
         self.after(POLL_INTERVAL_MS, self._drain)
+
+        # Đo lại mỗi khi cửa sổ đổi kích thước. Chỉ đo một lần lúc khởi động là
+        # không đủ: geometry thường được áp sau khi widget dựng xong.
+        self._fit_job: str | None = None
+        self._fit_announced = False
+        self.master.bind("<Configure>", self._on_window_resize)
 
         card = gpu_name()
         self._log(f"Card đồ hoạ: {card}" if card else
@@ -85,16 +154,18 @@ class App(ttk.Frame):
     # ----- dựng giao diện -------------------------------------------------
 
     def _build(self) -> None:
+        style = ttk.Style()
+        style.configure("Section.TButton", anchor="w", padding=(4, 5))
+
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=3)   # bảng danh sách
-        self.rowconfigure(5, weight=1)   # nhật ký
+        # minsize để bảng danh sách không bao giờ bị các khung phía trên ép về 0.
+        self.rowconfigure(3, weight=1, minsize=LIST_MIN_HEIGHT)
 
         self._build_folder()
         self._build_options()
         self._build_translate()
-        self._build_list()
+        self._build_middle()
         self._build_progress()
-        self._build_log()
 
     def _build_folder(self) -> None:
         frame = ttk.LabelFrame(self, text="Thư mục video", padding=8)
@@ -115,8 +186,10 @@ class App(ttk.Frame):
             row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
 
     def _build_options(self) -> None:
-        frame = ttk.LabelFrame(self, text="Tuỳ chọn nhận dạng", padding=8)
-        frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.panel_options = Collapsible(self, "Tuỳ chọn nhận dạng",
+                                         on_toggle=self._save_layout)
+        self.panel_options.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        frame = self.panel_options.body
         for col in (1, 3):
             frame.columnconfigure(col, weight=1)
 
@@ -148,25 +221,26 @@ class App(ttk.Frame):
                         variable=self.var_filter).grid(row=2, column=3, sticky="w", pady=4)
 
         ttk.Label(frame, text="Thư mục model:").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        model_row = ttk.Frame(frame)
-        model_row.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(8, 0), padx=(0, 12))
-        model_row.columnconfigure(0, weight=1)
+        row = ttk.Frame(frame)
+        row.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(8, 0), padx=(0, 12))
+        row.columnconfigure(0, weight=1)
 
         self.var_model_dir = tk.StringVar()
-        ttk.Entry(model_row, textvariable=self.var_model_dir).grid(row=0, column=0, sticky="ew")
-        ttk.Button(model_row, text="Chọn...", command=self._pick_model_dir).grid(
+        ttk.Entry(row, textvariable=self.var_model_dir).grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="Chọn...", command=self._pick_model_dir).grid(
             row=0, column=1, padx=(6, 0))
-        ttk.Button(model_row, text="Mặc định", command=self._reset_model_dir).grid(
+        ttk.Button(row, text="Mặc định", command=self._reset_model_dir).grid(
             row=0, column=2, padx=(4, 0))
 
-        ttk.Label(frame, foreground="#666666", text=(
-            "Để trống là dùng thư mục models\\ cạnh app. Trỏ vào cache HuggingFace "
-            "nếu muốn dùng lại model đã tải cho phần mềm khác."
-        )).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self._hint(frame, "Để trống là dùng thư mục models\\ cạnh app. Trỏ vào cache "
+                          "HuggingFace nếu muốn dùng lại model đã tải cho phần mềm khác."
+                   ).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(3, 0))
 
     def _build_translate(self) -> None:
-        frame = ttk.LabelFrame(self, text="Dịch sang tiếng Việt (Google Gemini)", padding=8)
-        frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.panel_translate = Collapsible(self, "Dịch sang tiếng Việt (Google Gemini)",
+                                           on_toggle=self._save_layout)
+        self.panel_translate.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        frame = self.panel_translate.body
         frame.columnconfigure(1, weight=1)
 
         self.var_translate = tk.BooleanVar(value=False)
@@ -176,38 +250,61 @@ class App(ttk.Frame):
         ).grid(row=0, column=0, columnspan=3, sticky="w")
 
         ttk.Label(frame, text="API key:").grid(row=1, column=0, sticky="nw", pady=(6, 0))
-        self.keys_box = tk.Text(frame, height=3, wrap="none", font=("Consolas", 9))
-        self.keys_box.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        keys_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.keys_box.yview)
-        keys_scroll.grid(row=1, column=2, sticky="ns", pady=(6, 0))
-        self.keys_box.configure(yscrollcommand=keys_scroll.set)
+        keys_wrap = ttk.Frame(frame)
+        keys_wrap.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        keys_wrap.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, foreground="#666666", text=(
-            "Mỗi dòng một key. Hết hạn mức hoặc key hỏng thì tự chuyển sang key kế tiếp. "
-            "Lưu ý: Google tính hạn mức theo project, nhiều key cùng project vẫn chung quota."
-        )).grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
+        self.keys_box = tk.Text(keys_wrap, height=3, wrap="none", font=("Consolas", 9))
+        self.keys_box.grid(row=0, column=0, sticky="ew")
+        scroll = ttk.Scrollbar(keys_wrap, orient="vertical", command=self.keys_box.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.keys_box.configure(yscrollcommand=scroll.set)
+
+        self.btn_eye = ttk.Button(keys_wrap, text="Hiện key", width=10,
+                                  command=self._toggle_key_visibility)
+        self.btn_eye.grid(row=0, column=2, sticky="n", padx=(6, 0))
+
+        self._hint(frame, "Mỗi dòng một key. Hết hạn mức thì tự chuyển sang key kế tiếp, "
+                          "key hỏng thì loại khỏi vòng quay. Google tính hạn mức theo "
+                          "project, nên nhiều key trong cùng một project vẫn dùng chung "
+                          "quota - muốn cộng dồn thì mỗi key phải khác project."
+                   ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=(3, 0))
 
         bottom = ttk.Frame(frame)
         bottom.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        bottom.columnconfigure(1, weight=1)
+        bottom.columnconfigure(2, weight=1)
 
         ttk.Label(bottom, text="Model Gemini:").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.var_gemini_model = tk.StringVar(value=DEFAULT_GEMINI_MODEL)
-        ttk.Combobox(bottom, textvariable=self.var_gemini_model,
-                     values=SUGGESTED_MODELS, width=24).grid(row=0, column=1, sticky="w")
+        self.combo_gemini = ttk.Combobox(bottom, textvariable=self.var_gemini_model,
+                                         values=SUGGESTED_MODELS, width=28)
+        self.combo_gemini.grid(row=0, column=1, sticky="w")
 
-        self.btn_check_keys = ttk.Button(bottom, text="Kiểm tra key",
-                                         command=self._check_keys)
-        self.btn_check_keys.grid(row=0, column=2, padx=(8, 0))
+        self.btn_models = ttk.Button(bottom, text="Lấy danh sách",
+                                     command=self._refresh_models)
+        self.btn_models.grid(row=0, column=2, sticky="w", padx=(6, 0))
+
+        self.btn_check_keys = ttk.Button(bottom, text="Kiểm tra key", command=self._check_keys)
+        self.btn_check_keys.grid(row=0, column=3, padx=(6, 0))
         self.btn_translate = ttk.Button(bottom, text="Dịch các SRT đã có",
                                         command=self._translate_existing)
-        self.btn_translate.grid(row=0, column=3, padx=(4, 0))
+        self.btn_translate.grid(row=0, column=4, padx=(4, 0))
 
-    def _build_list(self) -> None:
-        frame = ttk.LabelFrame(self, text="Danh sách video", padding=8)
-        frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+    def _build_middle(self) -> None:
+        """Bảng danh sách và nhật ký chia nhau chỗ còn lại, kéo được bằng chuột."""
+        self.split = ttk.PanedWindow(self, orient="vertical")
+        self.split.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+
+        self._build_list(self.split)
+        self._build_log(self.split)
+        self.split.add(self.list_frame, weight=4)
+        self.split.add(self.log_frame, weight=1)
+
+    def _build_list(self, parent) -> None:
+        frame = ttk.LabelFrame(parent, text="Danh sách video", padding=8)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
+        self.list_frame = frame
 
         header = ttk.Frame(frame)
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
@@ -221,14 +318,16 @@ class App(ttk.Frame):
                         variable=self.var_only_todo,
                         command=self._render_tree).grid(row=0, column=1, sticky="e")
 
+        # height thấp để bảng không đòi nhiều chỗ trên màn hình bé; weight trong
+        # PanedWindow sẽ cho nó nở ra khi còn chỗ.
         columns = ("name", "size", "status")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=6)
         self.tree.heading("name", text="Tên file")
         self.tree.heading("size", text="Dung lượng")
         self.tree.heading("status", text="Trạng thái")
-        self.tree.column("name", width=420, anchor="w")
-        self.tree.column("size", width=110, anchor="e", stretch=False)
-        self.tree.column("status", width=210, anchor="w", stretch=False)
+        self.tree.column("name", width=380, anchor="w")
+        self.tree.column("size", width=100, anchor="e", stretch=False)
+        self.tree.column("status", width=200, anchor="w", stretch=False)
         self.tree.grid(row=1, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -238,9 +337,24 @@ class App(ttk.Frame):
         for tag, color in STATUS_COLORS.items():
             self.tree.tag_configure(tag, foreground=color)
 
+    def _build_log(self, parent) -> None:
+        frame = ttk.LabelFrame(parent, text="Nhật ký", padding=4)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.log_frame = frame
+
+        self.log = tk.Text(frame, height=4, wrap="word", state="disabled",
+                           font=("Consolas", 9))
+        self.log.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, command=self.log.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=scroll.set)
+        for level, color in LEVEL_COLORS.items():
+            self.log.tag_configure(level, foreground=color)
+
     def _build_progress(self) -> None:
         frame = ttk.Frame(self)
-        frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         frame.columnconfigure(1, weight=1)
 
         self.var_status = tk.StringVar(value="Sẵn sàng.")
@@ -262,21 +376,6 @@ class App(ttk.Frame):
         self.btn_stop = ttk.Button(buttons, text="Dừng", command=self._stop, state="disabled")
         self.btn_stop.pack(fill="x", pady=(4, 0))
 
-    def _build_log(self) -> None:
-        frame = ttk.LabelFrame(self, text="Nhật ký", padding=4)
-        frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        self.log = tk.Text(frame, height=7, wrap="word", state="disabled",
-                           font=("Consolas", 9))
-        self.log.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(frame, command=self.log.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.log.configure(yscrollcommand=scroll.set)
-        for level, color in LEVEL_COLORS.items():
-            self.log.tag_configure(level, foreground=color)
-
     def _combo(self, parent, row, col, label, variable, values, callback=None) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", pady=4, padx=(0, 6))
         combo = ttk.Combobox(parent, textvariable=variable, values=values,
@@ -284,6 +383,15 @@ class App(ttk.Frame):
         combo.grid(row=row, column=col + 1, sticky="ew", pady=4, padx=(0, 12))
         if callback is not None:
             combo.bind("<<ComboboxSelected>>", callback)
+
+    def _hint(self, parent, text: str) -> ttk.Label:
+        """Dòng chú thích mờ, tự xuống dòng theo bề rộng thật của cửa sổ."""
+        label = ttk.Label(parent, text=text, foreground=HINT_COLOR, justify="left")
+        label.bind(
+            "<Configure>",
+            lambda event, w=label: w.configure(wraplength=max(event.width - 8, 200)),
+        )
+        return label
 
     # ----- quét thư mục ---------------------------------------------------
 
@@ -386,6 +494,87 @@ class App(ttk.Frame):
             self.tree.see(key)
         self._update_summary()
 
+    # ----- API key --------------------------------------------------------
+
+    def _read_keys(self) -> list[str]:
+        """Danh sách key hiện tại. Lúc đang che thì lấy từ bộ nhớ, không đọc ô."""
+        if not self.keys_hidden:
+            raw = self.keys_box.get("1.0", "end")
+            self._keys = [line.strip() for line in raw.splitlines() if line.strip()]
+        return list(self._keys)
+
+    def _show_keys(self, hidden: bool) -> None:
+        if hidden and not self.keys_hidden:
+            self._read_keys()          # chốt nội dung trước khi che
+
+        self.keys_hidden = hidden
+        self.keys_box.configure(state="normal")
+        self.keys_box.delete("1.0", "end")
+        shown = [mask_key(k) for k in self._keys] if hidden else list(self._keys)
+        self.keys_box.insert("1.0", "\n".join(shown))
+        self.keys_box.configure(state="disabled" if hidden else "normal")
+        self.btn_eye.configure(text="Hiện key" if hidden else "Ẩn key")
+
+    def _toggle_key_visibility(self) -> None:
+        self._show_keys(not self.keys_hidden)
+
+    def _refresh_models(self) -> None:
+        """Hỏi thẳng Google danh sách model thật thay vì tin vào danh sách chết."""
+        keys = self._read_keys()
+        if not keys:
+            messagebox.showinfo("Chưa có key", "Hãy dán ít nhất một API key.")
+            return
+
+        self.btn_models.configure(state="disabled")
+        self._log("Đang lấy danh sách model từ Google...")
+
+        def work() -> None:
+            try:
+                self.model_results.put(fetch_models(keys))
+            except Exception as exc:
+                self.model_results.put(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_models(self, result: tuple[list[str], str] | Exception) -> None:
+        self.btn_models.configure(state="normal")
+
+        if isinstance(result, Exception):
+            self._log(f"Không lấy được danh sách model: {result}", "error")
+            return
+
+        models, note = result
+        self.combo_gemini.configure(values=models)
+        self._log(note, "success")
+
+        current = self.var_gemini_model.get().strip()
+        if current not in models and models:
+            self.var_gemini_model.set(models[0])
+            self._log(f"'{current}' không có trong danh sách, đã chọn {models[0]}.", "warn")
+
+    def _check_keys(self) -> None:
+        """Hỏi Gemini xem từng key còn dùng được không."""
+        keys = self._read_keys()
+        if not keys:
+            messagebox.showinfo("Chưa có key", "Hãy dán ít nhất một API key.")
+            return
+
+        self.btn_check_keys.configure(state="disabled")
+        self._log(f"Đang kiểm tra {len(keys)} key...")
+
+        def work() -> None:
+            for position, key in enumerate(keys, start=1):
+                tail = key[-4:] if len(key) >= 4 else "????"
+                ok, note = check_key(key)
+                self.events.put(pipeline.Event(
+                    kind="log",
+                    level="success" if ok else "error",
+                    message=f"key #{position} (...{tail}): {note}",
+                ))
+            self.events.put(pipeline.Event(kind="keys_checked"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ----- đồng bộ với Settings -------------------------------------------
 
     def _apply_settings(self) -> None:
@@ -401,14 +590,19 @@ class App(ttk.Frame):
         self.var_model_dir.set(s.model_dir)
         self.var_translate.set(s.translate_enabled)
         self.var_gemini_model.set(s.gemini_model or DEFAULT_GEMINI_MODEL)
-        self.keys_box.delete("1.0", "end")
-        self.keys_box.insert("1.0", "\n".join(s.gemini_keys))
+
+        self._keys = list(s.gemini_keys)
+        # Có key sẵn thì che ngay, chưa có thì để mở cho dễ dán vào.
+        self._show_keys(s.hide_keys and bool(self._keys))
 
         self.var_language.set(next(
             (label for label, code in LANGUAGES if code == s.language), LANGUAGES[0][0]))
         self.var_variant.set(next(
             (label for label, code in CHINESE_VARIANTS if code == s.chinese_variant),
             CHINESE_VARIANTS[0][0]))
+
+        self.panel_options.set_expanded(s.panel_options_open, notify=False)
+        self.panel_translate.set_expanded(s.panel_translate_open, notify=False)
 
     def _collect_settings(self) -> Settings:
         s = self.settings
@@ -426,7 +620,57 @@ class App(ttk.Frame):
         s.gemini_model = self.var_gemini_model.get().strip() or DEFAULT_GEMINI_MODEL
         s.language = dict(LANGUAGES).get(self.var_language.get())
         s.chinese_variant = dict(CHINESE_VARIANTS).get(self.var_variant.get(), "s")
+        s.panel_options_open = self.panel_options.expanded
+        s.panel_translate_open = self.panel_translate.expanded
+        s.hide_keys = self.keys_hidden
         return s
+
+    def _on_window_resize(self, event) -> None:
+        """Gom nhiều sự kiện resize liên tiếp thành một lần đo."""
+        if event.widget is not self.master:
+            return
+        if self._fit_job is not None:
+            self.after_cancel(self._fit_job)
+        self._fit_job = self.after(150, self._fit_to_window)
+
+    def _fit_to_window(self) -> None:
+        """Cửa sổ không đủ cao thì gập bớt khung cho bảng danh sách có chỗ.
+
+        Gập khung Dịch trước vì nó ít dùng thường xuyên hơn khung nhận dạng.
+        Chỉ gập chứ không bao giờ tự mở, và không ghi đè lựa chọn đã lưu - kéo
+        cửa sổ to ra rồi bấm tiêu đề là mở lại được.
+        """
+        self._fit_job = None
+        if not self.winfo_exists():
+            return
+
+        self.update_idletasks()
+        available = self.winfo_height()
+        if available <= 1:
+            return
+
+        folded = []
+        for panel in (self.panel_translate, self.panel_options):
+            if self.winfo_reqheight() <= available:
+                break
+            if panel.expanded:
+                panel.set_expanded(False, notify=False)
+                folded.append(panel.title)
+                self.update_idletasks()
+
+        if folded and not self._fit_announced:
+            self._fit_announced = True
+            self._log(
+                "Cửa sổ hơi thấp nên đã gập tạm: " + ", ".join(folded)
+                + ". Bấm vào tiêu đề để mở lại, hoặc kéo cửa sổ cao hơn.",
+                "info",
+            )
+
+    def _save_layout(self) -> None:
+        """Ghi nhớ trạng thái gập/mở ngay để lần mở sau giữ nguyên."""
+        self.settings.panel_options_open = self.panel_options.expanded
+        self.settings.panel_translate_open = self.panel_translate.expanded
+        self.settings.save()
 
     # ----- sự kiện giao diện ----------------------------------------------
 
@@ -463,79 +707,24 @@ class App(ttk.Frame):
                 label for label, lang in LANGUAGES if lang == "en"))
             self._log("Model này chỉ hiểu tiếng Anh, đã chuyển ngôn ngữ sang English.", "warn")
 
-    def _start(self) -> None:
-        if self.worker is not None and self.worker.is_alive():
-            return
+    def _busy(self, busy: bool) -> None:
+        self.btn_start.configure(state="disabled" if busy else "normal")
+        self.btn_translate.configure(state="disabled" if busy else "normal")
+        self.btn_stop.configure(state="normal" if busy else "disabled")
 
+    def _launch(self, action, status: str) -> None:
+        """Chuẩn bị rồi chạy một công việc dài ở thread riêng."""
         settings = self._collect_settings()
-        if not settings.input_dir or not Path(settings.input_dir).is_dir():
-            messagebox.showerror("Thiếu thư mục", "Hãy chọn một thư mục chứa video.")
-            return
-
         settings.save()
         self.cancel.clear()
         self.bar_file["value"] = 0
         self.bar_total["value"] = 0
-        self.btn_start.configure(state="disabled")
-        self.btn_translate.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.var_status.set("Đang chuẩn bị...")
-
-        self.worker = threading.Thread(target=self._work, args=(settings,), daemon=True)
-        self.worker.start()
-
-    def _read_keys(self) -> list[str]:
-        raw = self.keys_box.get("1.0", "end")
-        return [line.strip() for line in raw.splitlines() if line.strip()]
-
-    def _check_keys(self) -> None:
-        """Hỏi Gemini xem từng key còn dùng được không và có model nào."""
-        keys = self._read_keys()
-        if not keys:
-            messagebox.showinfo("Chưa có key", "Hãy dán ít nhất một API key.")
-            return
-
-        self.btn_check_keys.configure(state="disabled")
-        self._log(f"Đang kiểm tra {len(keys)} key...")
-
-        def work() -> None:
-            for position, key in enumerate(keys, start=1):
-                tail = key[-4:] if len(key) >= 4 else "????"
-                ok, note = check_key(key)
-                self.events.put(pipeline.Event(
-                    kind="log",
-                    level="success" if ok else "error",
-                    message=f"key #{position} (...{tail}): {note}",
-                ))
-            self.events.put(pipeline.Event(kind="keys_checked"))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _translate_existing(self) -> None:
-        """Dịch các file .srt có sẵn, không nhận dạng lại."""
-        if self.worker is not None and self.worker.is_alive():
-            return
-
-        settings = self._collect_settings()
-        if not settings.input_dir or not Path(settings.input_dir).is_dir():
-            messagebox.showerror("Thiếu thư mục", "Hãy chọn một thư mục chứa video.")
-            return
-        if not settings.gemini_keys:
-            messagebox.showerror("Thiếu API key", "Hãy dán ít nhất một API key của Gemini.")
-            return
-
-        settings.save()
-        self.cancel.clear()
-        self.bar_file["value"] = 0
-        self.bar_total["value"] = 0
-        self.btn_start.configure(state="disabled")
-        self.btn_translate.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.var_status.set("Đang dịch...")
+        self._busy(True)
+        self.var_status.set(status)
 
         def work() -> None:
             try:
-                pipeline.translate_existing(settings, emit=self.events.put, cancel=self.cancel)
+                action(settings, emit=self.events.put, cancel=self.cancel)
             except Exception as exc:
                 self.events.put(pipeline.Event(kind="finished", level="error",
                                                message=f"Dừng vì lỗi: {exc}"))
@@ -543,31 +732,48 @@ class App(ttk.Frame):
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
 
+    def _running(self) -> bool:
+        return self.worker is not None and self.worker.is_alive()
+
+    def _folder_ready(self) -> bool:
+        folder = self.var_dir.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror("Thiếu thư mục", "Hãy chọn một thư mục chứa video.")
+            return False
+        return True
+
+    def _start(self) -> None:
+        if self._running() or not self._folder_ready():
+            return
+        self._launch(pipeline.run, "Đang chuẩn bị...")
+
+    def _translate_existing(self) -> None:
+        """Dịch các file .srt có sẵn, không nhận dạng lại."""
+        if self._running() or not self._folder_ready():
+            return
+        if not self._read_keys():
+            messagebox.showerror("Thiếu API key", "Hãy dán ít nhất một API key của Gemini.")
+            return
+        self._launch(pipeline.translate_existing, "Đang dịch...")
+
     def _stop(self) -> None:
         self.cancel.set()
         self.btn_stop.configure(state="disabled")
         self.var_status.set("Đang dừng, chờ file hiện tại kết thúc...")
 
-    def _work(self, settings: Settings) -> None:
-        try:
-            pipeline.run(settings, emit=self.events.put, cancel=self.cancel)
-        except Exception as exc:
-            self.events.put(pipeline.Event(kind="finished", level="error",
-                                           message=f"Dừng vì lỗi: {exc}"))
-
     # ----- nhận sự kiện từ thread xử lý -----------------------------------
 
     def _drain(self) -> None:
-        try:
-            while True:
-                self._apply_scan(*self.scan_results.get_nowait())
-        except queue.Empty:
-            pass
-        try:
-            while True:
-                self._handle(self.events.get_nowait())
-        except queue.Empty:
-            pass
+        if not self.winfo_exists():
+            return  # cửa sổ đã đóng, đừng hẹn vòng kế tiếp
+        for source, handler in ((self.scan_results, lambda r: self._apply_scan(*r)),
+                                (self.model_results, self._apply_models),
+                                (self.events, self._handle)):
+            try:
+                while True:
+                    handler(source.get_nowait())
+            except queue.Empty:
+                pass
         self.after(POLL_INTERVAL_MS, self._drain)
 
     def _handle(self, event: pipeline.Event) -> None:
@@ -582,6 +788,13 @@ class App(ttk.Frame):
         elif event.kind == "file_progress":
             self.bar_file["value"] = event.progress * 100
 
+        elif event.kind == "translating":
+            self._set_status(event.path, "Đang dịch...", "running")
+            self._log(event.message, event.level)
+
+        elif event.kind == "keys_checked":
+            self.btn_check_keys.configure(state="normal")
+
         elif event.kind == "file_done":
             self.bar_file["value"] = 100
             if event.total:
@@ -594,21 +807,12 @@ class App(ttk.Frame):
                                  "have", has_srt=True)
             self._log(f"[{event.index}/{event.total}] {event.message}", event.level)
 
-        elif event.kind == "translating":
-            self._set_status(event.path, "Đang dịch...", "running")
-            self._log(event.message, event.level)
-
-        elif event.kind == "keys_checked":
-            self.btn_check_keys.configure(state="normal")
-
         elif event.kind == "finished":
             if event.level == "success":
                 self.bar_total["value"] = 100
             self.var_status.set(event.message)
             self._log(event.message, event.level)
-            self.btn_start.configure(state="normal")
-            self.btn_translate.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
+            self._busy(False)
 
         else:
             self._log(event.message, event.level)
@@ -620,7 +824,7 @@ class App(ttk.Frame):
         self.log.configure(state="disabled")
 
     def on_close(self) -> None:
-        if self.worker is not None and self.worker.is_alive():
+        if self._running():
             if not messagebox.askokcancel("Đang chạy", "Đang xử lý dở. Thoát luôn?"):
                 return
             self.cancel.set()
@@ -631,8 +835,13 @@ class App(ttk.Frame):
 def main() -> int:
     root = tk.Tk()
     root.title("VideoOCR - Quét video xuất phụ đề SRT")
-    root.geometry("900x760")
-    root.minsize(780, 640)
+
+    # Vừa với màn hình thật thay vì cố định một kích thước có thể tràn ra ngoài.
+    height = min(880, max(560, root.winfo_screenheight() - 160))
+    width = min(1000, max(760, root.winfo_screenwidth() - 120))
+    root.geometry(f"{width}x{height}")
+    # Đủ chỗ cho thư mục + hai tiêu đề gập + bảng danh sách + thanh tiến trình.
+    root.minsize(720, 600)
 
     try:
         ttk.Style().theme_use("vista")

@@ -57,6 +57,16 @@ Trong lúc chạy, cột trạng thái đổi theo thời gian thực:
 
 Nút **Quét lại** làm mới danh sách nếu bạn vừa thêm hay xoá file bên ngoài.
 
+### Màn hình nhỏ
+
+Hai khung *Tuỳ chọn nhận dạng* và *Dịch tiếng Việt* **gập lại được** — bấm vào tiêu
+đề để đóng/mở, app nhớ trạng thái cho lần sau. Ranh giới giữa bảng danh sách và
+nhật ký **kéo được bằng chuột**.
+
+Nếu cửa sổ quá thấp để chứa hết, app tự gập bớt khung để bảng danh sách luôn có chỗ
+và nút Bắt đầu không bị đẩy ra ngoài. Nó chỉ gập chứ không bao giờ tự mở, và không
+ghi đè lựa chọn bạn đã lưu.
+
 ### Các tuỳ chọn
 
 | Mục | Ý nghĩa |
@@ -115,8 +125,20 @@ khỏi vòng quay ngay lần đầu.
 > tăng thêm được gì. Muốn có tác dụng thật, mỗi key phải thuộc một project khác nhau
 > (hoặc một tài khoản Google khác nhau).
 
-Nút **"Kiểm tra key"** hỏi thẳng Google xem từng key còn sống không và dùng được
-những model nào — tiện để biết tên model nào đang khả dụng với tài khoản của bạn.
+Nút **"Kiểm tra key"** hỏi thẳng Google xem từng key còn sống không.
+
+Key hiển thị ở dạng che (`AIza••••••••1R1s`), bấm **"Hiện key"** mới thấy đầy đủ.
+Nhờ vậy chụp màn hình gửi cho người khác không bị lộ key.
+
+### Chọn model
+
+Danh sách trong dropdown ban đầu chỉ là gợi ý — Google thêm bớt model liên tục nên
+danh sách cố định luôn lạc hậu. Bấm **"Lấy danh sách"** để hỏi thẳng API xem tài
+khoản của bạn dùng được những model nào.
+
+App tự lọc bỏ những model không dịch chữ được (nhúng vector, sinh ảnh, sinh video,
+đọc giọng nói) và xếp model ổn định lên trước bản preview. Nếu model đang chọn
+không có trong danh sách thật, app tự đổi sang model đầu tiên và báo trong nhật ký.
 
 ### Mốc thời gian có bị lệch không
 
