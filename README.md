@@ -44,25 +44,25 @@ file đã có SRT và bao nhiêu còn thiếu.
 Tích **"Chỉ hiện file chưa có SRT"** để ẩn bớt những file đã xong — tiện khi thư
 mục có hàng trăm video làm dở.
 
-Trong lúc chạy, cột trạng thái đổi theo thời gian thực:
+Bảng có **hai cột trạng thái** ứng với hai bước của quy trình, đổi theo thời gian
+thực trong lúc chạy:
 
-Bảng có **hai cột trạng thái tách riêng** — phụ đề gốc và bản dịch không gộp chung:
-
-| Cột **Phụ đề** | Nghĩa |
+| Cột **Nguyên ngữ (.stt)** | Nghĩa |
 |---|---|
-| Chưa có | Chưa có phụ đề, sẽ được xử lý |
-| Đã có | Đã có phụ đề, sẽ bỏ qua (trừ khi bật ghi đè) |
-| Đang xử lý... | Đang nhận dạng |
-| Xong · N khối | Vừa xuất SRT với N khối phụ đề |
-| Lỗi | Không xử lý được, xem lý do ở nhật ký |
+| Chưa có | Chưa nhận dạng |
+| Đang nhận dạng... | Whisper đang chạy |
+| Xong · N khối | Vừa nhận ra N câu thoại |
+| Đã có | Có sẵn từ lần chạy trước, sẽ không nhận dạng lại |
+| Đã xoá / — | Đã dọn sau khi dịch xong, hoặc chưa từng có |
+| Lỗi | Không nhận dạng được, xem lý do ở nhật ký |
 
-| Cột **Bản dịch** | Nghĩa |
+| Cột **Phụ đề (.srt)** | Nghĩa |
 |---|---|
-| Chưa có | Chưa có file .vi.srt |
-| Đã có | Đã có bản tiếng Việt từ trước |
+| Chưa có | Chưa có bản cuối cùng |
 | Đang dịch... | Đang gửi sang Gemini |
-| Xong | Vừa dịch xong |
-| Lỗi | Dịch không thành công; bản nguyên ngữ vẫn còn nguyên |
+| Xong · N khối | Đã có bản cuối với N khối |
+| Đã có | Đã xong từ trước, sẽ bỏ qua (trừ khi bật ghi đè) |
+| Lỗi | Dịch không xong; bản .stt vẫn còn để chạy lại |
 
 Nút **Quét lại** làm mới danh sách nếu bạn vừa thêm hay xoá file bên ngoài.
 
@@ -107,17 +107,19 @@ C:\Users\<tên>\.cache\huggingface\hub
 ## Dịch sang tiếng Việt bằng Gemini
 
 Tích **"Dịch tự động sau khi nhận dạng xong"**, dán API key rồi chạy như bình thường.
-Mỗi video sẽ cho ra hai file:
+
+Kết quả cuối cùng là **một file `.srt` tiếng Việt duy nhất**:
 
 ```
 EP01.mp4
-EP01.srt        <- nguyên ngữ (tiếng Trung)
-EP01.vi.srt     <- tiếng Việt
+EP01.srt        <- tiếng Việt, đây là file trình phát sẽ dùng
 ```
 
-Bản gốc luôn được giữ lại. Nếu dịch hỏng giữa chừng, bạn vẫn còn phụ đề nguyên ngữ
-và chỉ cần bấm **"Dịch các SRT đã có"** để làm lại riêng phần dịch — không phải
-nhận dạng lại từ đầu.
+Nếu dịch hỏng giữa chừng, bản nguyên ngữ `EP01.stt` vẫn nằm đó. Chạy lại là app
+dịch tiếp từ đó, **không nhận dạng lại từ đầu** — bước tốn thời gian nhất được
+giữ nguyên. Bấm **"Dịch bản .stt đã có"** nếu chỉ muốn làm lại riêng phần dịch.
+
+Tích **"Giữ lại bản nguyên ngữ .stt"** nếu bạn muốn đối chiếu với bản gốc.
 
 ### Lấy API key
 
@@ -181,6 +183,25 @@ nếu máy dùng chung với người khác thì bạn nên cân nhắc.
 
 Nhật ký chỉ hiện 4 ký tự cuối của key (`key #1 (...aB3k)`), không bao giờ ghi cả key
 ra màn hình.
+
+## Gộp video
+
+Bấm **"Gộp video..."** để nối toàn bộ video trong danh sách thành một file, theo
+đúng thứ tự đang hiện trong bảng. Tiện khi bạn tải về hàng chục clip ngắn của cùng
+một tập phim.
+
+App tự dò thông số trước khi làm:
+
+- **Cùng codec và độ phân giải** → nối thẳng, không giải mã lại. Nhanh gần bằng
+  tốc độ chép file và **chất lượng giữ nguyên tuyệt đối**. Clip tải từ cùng một
+  nguồn hầu như luôn rơi vào trường hợp này.
+- **Khác nhau** → phải mã hoá lại, mỗi clip được co giãn về cùng khung hình. Chậm
+  hơn nhiều và chất lượng giảm đôi chút. App báo rõ lý do trước khi bạn đồng ý.
+
+File kết quả mặc định nằm ở **thư mục cha**, đặt tên theo thư mục nguồn — để nó
+không lọt vào danh sách video cần làm phụ đề. Bạn đổi được chỗ lưu trong hộp thoại.
+
+Bấm **Dừng** giữa chừng thì không để lại file video hỏng nào.
 
 ## Chạy bằng dòng lệnh
 
@@ -259,6 +280,7 @@ videoocr/
   chinese.py      Chuyển giản thể <-> phồn thể bằng OpenCC
   pipeline.py     Điều phối toàn bộ, phát sự kiện tiến trình
   translator.py   Gọi Gemini dịch tiếng Việt, xoay vòng API key
+  merger.py       Gộp nhiều video thành một file bằng ffmpeg
   gui.py          Cửa sổ tkinter
   cli.py          Giao diện dòng lệnh
 ```

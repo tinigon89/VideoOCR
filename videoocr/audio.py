@@ -15,7 +15,7 @@ _APP_ROOT = Path(__file__).resolve().parent.parent
 _BUNDLED_BIN = _APP_ROOT / "bin"
 
 # Trên Windows, đừng để cửa sổ console đen nháy lên mỗi lần gọi ffmpeg.
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 class FFmpegNotFound(RuntimeError):
@@ -58,7 +58,7 @@ def probe_duration(video: Path) -> float:
                 "-show_entries", "format=duration",
                 "-of", "json", str(video),
             ],
-            capture_output=True, text=True, creationflags=_NO_WINDOW,
+            capture_output=True, text=True, creationflags=NO_WINDOW,
         )
         if result.returncode != 0:
             return 0.0
@@ -76,7 +76,7 @@ def has_audio_stream(video: Path) -> bool:
                 "-show_entries", "stream=index",
                 "-of", "json", str(video),
             ],
-            capture_output=True, text=True, creationflags=_NO_WINDOW,
+            capture_output=True, text=True, creationflags=NO_WINDOW,
         )
         if result.returncode != 0:
             return True  # Không chắc thì cứ thử tách, để ffmpeg nói tiếng nói cuối.
@@ -99,7 +99,7 @@ def extract_audio(video: Path, out_wav: Path) -> Path:
         "-loglevel", "error",
         str(out_wav),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
+    result = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW)
 
     if result.returncode != 0 or not out_wav.exists() or out_wav.stat().st_size == 0:
         detail = (result.stderr or "").strip().splitlines()

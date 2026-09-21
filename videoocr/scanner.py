@@ -1,17 +1,28 @@
-"""Quét thư mục tìm video và quyết định file nào cần xử lý."""
+"""Quét thư mục tìm video và quyết định file nào cần xử lý.
+
+Sơ đồ file của một video:
+
+* ``phim.stt`` - bản nguyên ngữ do nhận dạng giọng nói tạo ra. Đây là bản trung
+  gian; đuôi .stt cố tình khác .srt để trình phát không tự nạp nhầm, và để nhìn
+  vào thư mục là biết ngay file nào đã xong file nào còn dở.
+* ``phim.srt`` - bản cuối cùng, cái mà trình phát sẽ dùng. Có bật dịch thì đây
+  là tiếng Việt, không bật thì chính là bản nguyên ngữ.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import TRANSLATED_SUFFIX, VIDEO_EXTENSIONS
+from .config import STT_SUFFIX, VIDEO_EXTENSIONS
 
 
 @dataclass(frozen=True)
 class Job:
     video: Path
-    srt: Path
+    stt: Path           # bản nguyên ngữ, trung gian
+    srt: Path           # bản cuối cùng
+    needs_transcribe: bool = True
 
 
 @dataclass(frozen=True)
@@ -19,28 +30,28 @@ class Entry:
     """Một video cùng thông tin để hiển thị trong bảng."""
 
     video: Path
+    stt: Path
     srt: Path
     size: int
+    has_stt: bool
     has_srt: bool
     relative: str      # đường dẫn tương đối so với thư mục gốc, để hiện cho gọn
-    vi: Path | None = None
-    has_vi: bool = False
 
 
 def srt_path_for(video: Path) -> Path:
-    """video.mp4 -> video.srt, nằm cùng thư mục."""
+    """video.mp4 -> video.srt, bản cuối cùng nằm cùng thư mục."""
     return video.with_suffix(".srt")
 
 
-def vi_path_for(video: Path) -> Path:
-    """phim.mp4 -> phim.vi.srt, nằm cạnh bản nguyên ngữ."""
-    return video.with_name(video.stem + TRANSLATED_SUFFIX)
+def stt_path_for(video: Path) -> Path:
+    """video.mp4 -> video.stt, bản nguyên ngữ trung gian."""
+    return video.with_suffix(STT_SUFFIX)
 
 
-def has_subtitle(srt: Path) -> bool:
+def has_subtitle(path: Path) -> bool:
     """File rỗng coi như chưa có - nhiều khả năng là tàn dư của lần chạy hỏng."""
     try:
-        return srt.is_file() and srt.stat().st_size > 0
+        return path.is_file() and path.stat().st_size > 0
     except OSError:
         return False
 
@@ -71,16 +82,28 @@ def find_videos(root: Path, recursive: bool = True) -> list[Path]:
 
 
 def plan_jobs(videos: list[Path], overwrite: bool = False) -> tuple[list[Job], list[Path]]:
-    """Chia danh sách video thành (cần làm, bỏ qua vì đã có .srt)."""
+    """Chia danh sách video thành (cần làm, bỏ qua vì đã có bản cuối).
+
+    Video nào đã có sẵn ``.stt`` thì không nhận dạng lại - lần chạy trước đã làm
+    phần nặng nhất rồi, chỉ còn thiếu bước sau.
+    """
     todo: list[Job] = []
     skipped: list[Path] = []
 
     for video in videos:
         srt = srt_path_for(video)
+        stt = stt_path_for(video)
+
         if has_subtitle(srt) and not overwrite:
             skipped.append(video)
-        else:
-            todo.append(Job(video=video, srt=srt))
+            continue
+
+        todo.append(Job(
+            video=video,
+            stt=stt,
+            srt=srt,
+            needs_transcribe=overwrite or not has_subtitle(stt),
+        ))
 
     return todo, skipped
 
@@ -90,7 +113,6 @@ def scan_entries(root: Path, recursive: bool = True) -> list[Entry]:
     entries: list[Entry] = []
 
     for video in find_videos(root, recursive=recursive):
-        srt = srt_path_for(video)
         try:
             size = video.stat().st_size
         except OSError:
@@ -100,15 +122,15 @@ def scan_entries(root: Path, recursive: bool = True) -> list[Entry]:
         except ValueError:  # pragma: no cover - find_videos luôn trả về file trong root
             relative = video.name
 
-        vi = vi_path_for(video)
+        stt, srt = stt_path_for(video), srt_path_for(video)
         entries.append(Entry(
             video=video,
+            stt=stt,
             srt=srt,
             size=size,
+            has_stt=has_subtitle(stt),
             has_srt=has_subtitle(srt),
             relative=relative,
-            vi=vi,
-            has_vi=has_subtitle(vi),
         ))
 
     return entries

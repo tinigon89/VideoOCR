@@ -85,8 +85,9 @@ CHINESE_VARIANTS: list[tuple[str, str]] = [
 # là buộc nó chấm câu - bộ cắt dòng dựa vào dấu câu để ngắt cho đẹp.
 DEFAULT_ZH_PROMPT = "以下是普通话的句子。"
 
-# Đuôi của bản dịch: phim.mp4 -> phim.srt (nguyên ngữ) + phim.vi.srt (tiếng Việt).
-TRANSLATED_SUFFIX = ".vi.srt"
+# phim.mp4 -> phim.stt (bản nguyên ngữ, trung gian) -> phim.srt (bản cuối cùng).
+# Đuôi .stt cố tình khác .srt để trình phát không tự nạp nhầm bản chưa dịch.
+STT_SUFFIX = ".stt"
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -168,6 +169,8 @@ class Settings:
     translate_batch_size: int = 40
     # Hướng dẫn riêng cho người dịch: xưng hô, văn phong, tên riêng giữ nguyên...
     translate_prompt: str = ""
+    # Giữ lại bản nguyên ngữ .stt sau khi đã dịch xong.
+    keep_stt: bool = False
 
     # Trạng thái gập/mở của các khung, để màn hình thấp còn chỗ cho bảng danh sách.
     panel_options_open: bool = True

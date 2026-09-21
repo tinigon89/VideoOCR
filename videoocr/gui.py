@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -29,8 +31,8 @@ from .config import (
     model_advice,
     resolve_model_dir,
 )
-from .gpu import gpu_name
-from .scanner import Entry, format_size, scan_entries
+from .scanner import Entry, format_size, has_subtitle, scan_entries
+from .merger import MergeCancelled, default_output, inspect, merge
 from .translator import SUGGESTED_MODELS, check_key, fetch_models
 
 POLL_INTERVAL_MS = 100
@@ -50,11 +52,13 @@ STATUS_COLORS = {
     "error": "#c02020",
 }
 
-# Cột "Phụ đề" và cột "Bản dịch" giữ trạng thái riêng, không gộp chung nữa.
+# Hai cột trạng thái: bản nguyên ngữ .stt (trung gian) và .srt (bản cuối cùng).
+STT_TODO = "Chưa có"
+STT_HAVE = "Đã có"
+STT_GONE = "Đã xoá"
+STT_NONE = "—"      # chưa từng có, hoặc phụ đề do nơi khác làm
 SRT_TODO = "Chưa có"
 SRT_HAVE = "Đã có"
-VI_TODO = "Chưa có"
-VI_HAVE = "Đã có"
 
 HINT_COLOR = "#666666"
 
@@ -130,9 +134,14 @@ class App(ttk.Frame):
         # Trạng thái bảng. Khoá là đường dẫn tuyệt đối dạng chuỗi.
         # Mỗi file giữ hai trạng thái riêng: phụ đề gốc và bản dịch.
         self.entries: list[Entry] = []
-        self.srt_state: dict[str, tuple[str, str]] = {}   # khoá -> (chữ, tag màu)
-        self.vi_state: dict[str, tuple[str, str]] = {}
+        self.by_path: dict[str, Entry] = {}
+        self.stt_state: dict[str, tuple[str, str]] = {}   # khoá -> (chữ, tag màu)
+        self.srt_state: dict[str, tuple[str, str]] = {}
         self.has_srt: dict[str, bool] = {}
+
+        # Mốc thời gian của lượt chạy hiện tại.
+        self.run_started: float | None = None
+        self.timer_job: str | None = None
 
         # Nguồn sự thật của danh sách key; ô nhập có thể đang hiện dạng che.
         self._keys: list[str] = []
@@ -149,11 +158,8 @@ class App(ttk.Frame):
         self._fit_announced = False
         self.master.bind("<Configure>", self._on_window_resize)
 
-        card = gpu_name()
-        self._log(f"Card đồ hoạ: {card}" if card else
-                  "Không dò được GPU NVIDIA - sẽ chạy bằng CPU và chậm hơn nhiều.",
-                  "info" if card else "warn")
-
+        # Nhật ký để trống khi mới mở. Thông tin card đồ hoạ sẽ hiện lúc chạy,
+        # trong dòng báo nạp model.
         if self.var_dir.get():
             self._start_scan()
 
@@ -189,7 +195,10 @@ class App(ttk.Frame):
                         command=self._start_scan).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.var_overwrite = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text="Ghi đè file .srt đã có", variable=self.var_overwrite).grid(
-            row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+            row=1, column=1, sticky="w", pady=(6, 0))
+
+        self.btn_merge = ttk.Button(frame, text="Gộp video...", command=self._merge_videos)
+        self.btn_merge.grid(row=1, column=2, sticky="e", pady=(6, 0), padx=(4, 0))
 
     def _build_options(self) -> None:
         self.panel_options = Collapsible(self, "Tuỳ chọn nhận dạng",
@@ -254,9 +263,13 @@ class App(ttk.Frame):
 
         self.var_translate = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frame, text="Dịch tự động sau khi nhận dạng xong (xuất ra phim.vi.srt)",
+            frame, text="Dịch tự động sau khi nhận dạng xong (bản cuối là phim.srt)",
             variable=self.var_translate,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        self.var_keep_stt = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Giữ lại bản nguyên ngữ .stt",
+                        variable=self.var_keep_stt).grid(row=0, column=2, sticky="e")
 
         ttk.Label(frame, text="API key:").grid(row=1, column=0, sticky="nw", pady=(6, 0))
         keys_wrap = ttk.Frame(frame)
@@ -321,7 +334,7 @@ class App(ttk.Frame):
 
         self.btn_check_keys = ttk.Button(bottom, text="Kiểm tra key", command=self._check_keys)
         self.btn_check_keys.grid(row=0, column=3, padx=(6, 0))
-        self.btn_translate = ttk.Button(bottom, text="Dịch các SRT đã có",
+        self.btn_translate = ttk.Button(bottom, text="Dịch bản .stt đã có",
                                         command=self._translate_existing)
         self.btn_translate.grid(row=0, column=4, padx=(4, 0))
 
@@ -355,16 +368,16 @@ class App(ttk.Frame):
 
         # height thấp để bảng không đòi nhiều chỗ trên màn hình bé; weight trong
         # PanedWindow sẽ cho nó nở ra khi còn chỗ.
-        columns = ("name", "size", "srt", "vi")
+        columns = ("name", "size", "stt", "srt")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=6)
         self.tree.heading("name", text="Tên file")
         self.tree.heading("size", text="Dung lượng")
-        self.tree.heading("srt", text="Phụ đề")
-        self.tree.heading("vi", text="Bản dịch")
-        self.tree.column("name", width=320, anchor="w")
+        self.tree.heading("stt", text="Nguyên ngữ (.stt)")
+        self.tree.heading("srt", text="Phụ đề (.srt)")
+        self.tree.column("name", width=300, anchor="w")
         self.tree.column("size", width=95, anchor="e", stretch=False)
+        self.tree.column("stt", width=150, anchor="w", stretch=False)
         self.tree.column("srt", width=150, anchor="w", stretch=False)
-        self.tree.column("vi", width=130, anchor="w", stretch=False)
         self.tree.grid(row=1, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -376,15 +389,18 @@ class App(ttk.Frame):
 
     def _build_log(self, parent) -> None:
         frame = ttk.LabelFrame(parent, text="Nhật ký", padding=4)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
         self.log_frame = frame
 
+        ttk.Button(frame, text="Xoá nhật ký", command=self._clear_log).grid(
+            row=0, column=0, columnspan=2, sticky="e", pady=(0, 3))
+
         self.log = tk.Text(frame, height=4, wrap="word", state="disabled",
                            font=("Consolas", 9))
-        self.log.grid(row=0, column=0, sticky="nsew")
+        self.log.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(frame, command=self.log.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
+        scroll.grid(row=1, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scroll.set)
         for level, color in LEVEL_COLORS.items():
             self.log.tag_configure(level, foreground=color)
@@ -396,7 +412,11 @@ class App(ttk.Frame):
 
         self.var_status = tk.StringVar(value="Sẵn sàng.")
         ttk.Label(frame, textvariable=self.var_status).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        self.var_clock = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.var_clock, foreground=HINT_COLOR).grid(
+            row=0, column=2, sticky="e", pady=(0, 4))
 
         ttk.Label(frame, text="File này:").grid(row=1, column=0, sticky="w", padx=(0, 6))
         self.bar_file = ttk.Progressbar(frame, maximum=100)
@@ -461,26 +481,40 @@ class App(ttk.Frame):
 
         if isinstance(result, Exception):
             self.entries = []
+            self.by_path.clear()
+            self.stt_state.clear()
             self.srt_state.clear()
-            self.vi_state.clear()
             self.has_srt.clear()
             self._render_tree()
             self.var_summary.set(f"Không quét được: {result}")
             return
 
         self.entries = result
+        self.by_path = {str(e.video): e for e in result}
+        self.stt_state = {}
         self.srt_state = {}
-        self.vi_state = {}
         self.has_srt = {}
         for entry in result:
-            key = str(entry.video)
-            self.has_srt[key] = entry.has_srt
-            self.srt_state[key] = ((SRT_HAVE, "have") if entry.has_srt
-                                   else (SRT_TODO, "todo"))
-            self.vi_state[key] = ((VI_HAVE, "have") if entry.has_vi
-                                  else (VI_TODO, "todo"))
+            self._state_from_disk(entry)
 
         self._render_tree()
+
+    def _state_from_disk(self, entry: Entry) -> None:
+        """Đọc lại tình trạng hai file từ đĩa thay vì suy đoán."""
+        key = str(entry.video)
+        has_stt = has_subtitle(entry.stt)
+        has_final = has_subtitle(entry.srt)
+
+        self.has_srt[key] = has_final
+        self.srt_state[key] = (SRT_HAVE, "have") if has_final else (SRT_TODO, "todo")
+        if has_stt:
+            self.stt_state[key] = (STT_HAVE, "have")
+        elif has_final:
+            # Bản cuối đã có mà không thấy .stt. Có thể app đã dọn sau khi dịch,
+            # cũng có thể phụ đề do nơi khác làm - đừng khẳng định là "đã xoá".
+            self.stt_state[key] = (STT_NONE, "have")
+        else:
+            self.stt_state[key] = (STT_TODO, "todo")
 
     @staticmethod
     def _row_tag(srt_tag: str, vi_tag: str) -> str:
@@ -492,9 +526,9 @@ class App(ttk.Frame):
 
     def _row_values(self, entry: Entry) -> tuple:
         key = str(entry.video)
+        stt_text, _ = self.stt_state.get(key, (STT_TODO, "todo"))
         srt_text, _ = self.srt_state.get(key, (SRT_TODO, "todo"))
-        vi_text, _ = self.vi_state.get(key, (VI_TODO, "todo"))
-        return (entry.relative, format_size(entry.size), srt_text, vi_text)
+        return (entry.relative, format_size(entry.size), stt_text, srt_text)
 
     def _render_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -504,12 +538,12 @@ class App(ttk.Frame):
             key = str(entry.video)
             if only_todo and self.has_srt.get(key, False):
                 continue
+            _, stt_tag = self.stt_state.get(key, (STT_TODO, "todo"))
             _, srt_tag = self.srt_state.get(key, (SRT_TODO, "todo"))
-            _, vi_tag = self.vi_state.get(key, (VI_TODO, "todo"))
             self.tree.insert(
                 "", "end", iid=key,
                 values=self._row_values(entry),
-                tags=(self._row_tag(srt_tag, vi_tag),),
+                tags=(self._row_tag(stt_tag, srt_tag),),
             )
 
         self._update_summary()
@@ -521,29 +555,30 @@ class App(ttk.Frame):
 
         total_size = sum(e.size for e in self.entries)
         done = sum(1 for e in self.entries if self.has_srt.get(str(e.video), False))
-        dubbed = sum(1 for e in self.entries
-                     if self.vi_state.get(str(e.video), ("", ""))[0] != VI_TODO)
-        self.var_summary.set(
-            f"{len(self.entries)} video · {format_size(total_size)} · "
-            f"{done} có phụ đề · {len(self.entries) - done} chưa có · "
-            f"{dubbed} đã dịch"
-        )
+        waiting = sum(1 for e in self.entries
+                      if self.stt_state.get(str(e.video), ("", ""))[0] == STT_HAVE
+                      and not self.has_srt.get(str(e.video), False))
+        parts = [f"{len(self.entries)} video", format_size(total_size),
+                 f"{done} xong", f"{len(self.entries) - done} chưa"]
+        if waiting:
+            parts.append(f"{waiting} chờ dịch")
+        self.var_summary.set(" · ".join(parts))
 
     def _set_state(self, path: Path | None, column: str, text: str, tag: str,
                    has_srt: bool | None = None) -> None:
-        """Cập nhật một ô trạng thái. ``column`` là "srt" hoặc "vi"."""
+        """Cập nhật một ô trạng thái. ``column`` là "stt" hoặc "srt"."""
         if path is None:
             return
         key = str(path)
-        store = self.srt_state if column == "srt" else self.vi_state
+        store = self.stt_state if column == "stt" else self.srt_state
         store[key] = (text, tag)
         if has_srt is not None:
             self.has_srt[key] = has_srt
 
         if self.tree.exists(key):
+            _, stt_tag = self.stt_state.get(key, (STT_TODO, "todo"))
             _, srt_tag = self.srt_state.get(key, (SRT_TODO, "todo"))
-            _, vi_tag = self.vi_state.get(key, (VI_TODO, "todo"))
-            row_tag = self._row_tag(srt_tag, vi_tag)
+            row_tag = self._row_tag(stt_tag, srt_tag)
 
             # Ẩn dòng đã xong nếu đang bật bộ lọc, ngược lại chỉ cập nhật tại chỗ.
             if self.var_only_todo.get() and self.has_srt.get(key, False) \
@@ -651,6 +686,7 @@ class App(ttk.Frame):
         self.var_filter.set(s.filter_hallucinations)
         self.var_model_dir.set(s.model_dir)
         self.var_translate.set(s.translate_enabled)
+        self.var_keep_stt.set(s.keep_stt)
         self.var_gemini_model.set(s.gemini_model or DEFAULT_GEMINI_MODEL)
 
         self.prompt_box.delete("1.0", "end")
@@ -682,6 +718,7 @@ class App(ttk.Frame):
         s.filter_hallucinations = self.var_filter.get()
         s.model_dir = self.var_model_dir.get().strip()
         s.translate_enabled = self.var_translate.get()
+        s.keep_stt = self.var_keep_stt.get()
         s.gemini_keys = self._read_keys()
         s.gemini_model = self.var_gemini_model.get().strip() or DEFAULT_GEMINI_MODEL
         s.translate_prompt = self.prompt_box.get("1.0", "end").strip()
@@ -792,8 +829,8 @@ class App(ttk.Frame):
         )
 
     def _busy(self, busy: bool) -> None:
-        self.btn_start.configure(state="disabled" if busy else "normal")
-        self.btn_translate.configure(state="disabled" if busy else "normal")
+        for button in (self.btn_start, self.btn_translate, self.btn_merge):
+            button.configure(state="disabled" if busy else "normal")
         self.btn_stop.configure(state="normal" if busy else "disabled")
 
     def _launch(self, action, status: str) -> None:
@@ -805,6 +842,7 @@ class App(ttk.Frame):
         self.bar_total["value"] = 0
         self._busy(True)
         self.var_status.set(status)
+        self._start_clock()
 
         def work() -> None:
             try:
@@ -840,6 +878,78 @@ class App(ttk.Frame):
             return
         self._launch(pipeline.translate_existing, "Đang dịch...")
 
+    def _merge_videos(self) -> None:
+        """Gộp toàn bộ video trong danh sách thành một file."""
+        if self._running() or not self._folder_ready():
+            return
+
+        videos = [e.video for e in self.entries]
+        if len(videos) < 2:
+            messagebox.showinfo(
+                "Chưa đủ video",
+                "Cần ít nhất hai video trong danh sách mới có gì để gộp.")
+            return
+
+        # Dò trước để biết nối thẳng được hay phải mã hoá lại, rồi mới hỏi.
+        try:
+            _, can_copy, note = inspect(videos)
+        except Exception as exc:
+            messagebox.showerror("Không gộp được", str(exc))
+            return
+
+        folder = Path(self.var_dir.get().strip())
+        suggested = default_output(folder)
+        answer = messagebox.askokcancel(
+            "Gộp video",
+            f"Gộp {len(videos)} video theo đúng thứ tự trong bảng.\n\n{note}\n\n"
+            f"Kết quả lưu vào:\n{suggested}\n\nTiếp tục?",
+        )
+        if not answer:
+            return
+
+        chosen = filedialog.asksaveasfilename(
+            title="Lưu file gộp", defaultextension=".mp4",
+            initialdir=str(suggested.parent), initialfile=suggested.name,
+            filetypes=[("Video MP4", "*.mp4"), ("Tất cả", "*.*")],
+        )
+        if not chosen:
+            return
+
+        self.cancel.clear()
+        self.bar_file["value"] = 0
+        self.bar_total["value"] = 0
+        self._busy(True)
+        self._start_clock()
+        self.var_status.set(f"Đang gộp {len(videos)} video...")
+        self._log(note, "info" if can_copy else "warn")
+
+        output = Path(chosen)
+
+        def work() -> None:
+            def report(fraction: float) -> None:
+                self.events.put(pipeline.Event(
+                    kind="file_progress", progress=fraction))
+
+            try:
+                result, summary = merge(
+                    videos, output, on_progress=report, should_cancel=self.cancel.is_set)
+            except MergeCancelled:
+                self.events.put(pipeline.Event(
+                    kind="finished", level="warn", message="Đã dừng, chưa gộp xong."))
+                return
+            except Exception as exc:
+                self.events.put(pipeline.Event(
+                    kind="finished", level="error", message=f"Gộp hỏng: {exc}"))
+                return
+
+            self.events.put(pipeline.Event(kind="log", level="success", message=summary))
+            self.events.put(pipeline.Event(
+                kind="finished", level="success",
+                message=f"Đã gộp xong: {result.name}"))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
     def _stop(self) -> None:
         self.cancel.set()
         self.btn_stop.configure(state="disabled")
@@ -868,15 +978,15 @@ class App(ttk.Frame):
             self.bar_file["value"] = 0
             self.var_status.set(f"[{event.index}/{event.total}] {event.message}")
             if event.stage == "translate":
-                self._set_state(event.path, "vi", "Đang dịch...", "running")
+                self._set_state(event.path, "srt", "Đang dịch...", "running")
             else:
-                self._set_state(event.path, "srt", "Đang xử lý...", "running")
+                self._set_state(event.path, "stt", "Đang nhận dạng...", "running")
 
         elif event.kind == "file_progress":
             self.bar_file["value"] = event.progress * 100
 
         elif event.kind == "translating":
-            self._set_state(event.path, "vi", "Đang dịch...", "running")
+            self._set_state(event.path, "srt", "Đang dịch...", "running")
             self._log(event.message, event.level)
 
         elif event.kind == "keys_checked":
@@ -894,36 +1004,70 @@ class App(ttk.Frame):
                 self.bar_total["value"] = 100
             self.var_status.set(event.message)
             self._log(event.message, event.level)
+            self._stop_clock()
             self._busy(False)
 
         else:
             self._log(event.message, event.level)
-
-    # Kết quả phần dịch hiển thị ở cột "Bản dịch".
-    _VI_OUTCOMES = {
-        "done": ("Xong", "have"),
-        "skipped": ("Đã có", "have"),
-        "failed": ("Lỗi", "error"),
-    }
 
     def _apply_file_done(self, event: pipeline.Event) -> None:
         """Đổ kết quả một file vào đúng hai cột trạng thái."""
         only_translating = event.stage == "translate"
 
         if event.level == "error":
-            column = "vi" if only_translating else "srt"
+            column = "srt" if only_translating else "stt"
             self._set_state(event.path, column, "Lỗi", "error",
                             has_srt=None if only_translating else False)
             return
 
-        # Nút "Dịch các SRT đã có" không nhận dạng lại, đừng đụng vào cột phụ đề.
-        if not only_translating:
-            self._set_state(event.path, "srt", f"Xong · {event.cues} khối",
-                            "have", has_srt=True)
+        if event.translated == "failed":
+            # Bản nguyên ngữ vẫn còn nguyên, chỉ thiếu mỗi bước dịch.
+            self._set_state(event.path, "stt", f"Xong · {event.cues} khối", "have")
+            self._set_state(event.path, "srt", "Lỗi", "error")
+            return
 
-        if event.translated in self._VI_OUTCOMES:
-            text, tag = self._VI_OUTCOMES[event.translated]
-            self._set_state(event.path, "vi", text, tag)
+        self._set_state(event.path, "srt", f"Xong · {event.cues} khối",
+                        "have", has_srt=True)
+
+        # .stt còn hay đã dọn thì hỏi thẳng đĩa, khỏi đoán theo tuỳ chọn.
+        entry = self.by_path.get(str(event.path))
+        if entry is not None:
+            self._set_state(event.path, "stt",
+                            STT_HAVE if has_subtitle(entry.stt) else STT_GONE, "have")
+
+    def _clear_log(self) -> None:
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+    def _start_clock(self) -> None:
+        self.run_started = time.monotonic()
+        self.started_at = datetime.now()
+        self._tick()
+
+    def _tick(self) -> None:
+        """Cập nhật đồng hồ mỗi giây trong lúc đang chạy."""
+        if self.run_started is None or not self.winfo_exists():
+            return
+        self.var_clock.set(
+            f"Bắt đầu {self.started_at:%H:%M:%S} · "
+            f"đã chạy {pipeline.format_duration(time.monotonic() - self.run_started)}"
+        )
+        self.timer_job = self.after(1000, self._tick)
+
+    def _stop_clock(self) -> None:
+        if self.timer_job is not None:
+            self.after_cancel(self.timer_job)
+            self.timer_job = None
+        if self.run_started is None:
+            return
+        total = pipeline.format_duration(time.monotonic() - self.run_started)
+        finished = datetime.now()
+        self.var_clock.set(
+            f"Bắt đầu {self.started_at:%H:%M:%S} · kết thúc {finished:%H:%M:%S} · "
+            f"tổng {total}"
+        )
+        self.run_started = None
 
     def _log(self, message: str, level: str = "info") -> None:
         self.log.configure(state="normal")

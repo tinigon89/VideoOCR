@@ -14,7 +14,7 @@ from pathlib import Path
 from . import audio as audio_mod
 from . import chinese, cleaner, gpu
 from .config import DEFAULT_ZH_PROMPT, Settings, resolve_model_dir
-from .scanner import Job, find_videos, has_subtitle, plan_jobs, vi_path_for
+from .scanner import Job, find_videos, has_subtitle, plan_jobs, stt_path_for
 from .subtitle import Cue, build_cues, finalize_cues, parse_srt, render_srt, wrap_text
 from .transcriber import OutOfMemoryError, Transcriber, TranscriptionError
 from .translator import GeminiTranslator, TranslationError
@@ -68,6 +68,23 @@ Emit = Callable[[Event], None]
 
 def _noop(event: Event) -> None:
     pass
+
+
+def format_duration(seconds: float) -> str:
+    """12.3 -> '12 giây'; 754 -> '12 phút 34 giây'; 7384 -> '2 giờ 3 phút'."""
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+
+    if hours:
+        return f"{hours} giờ {minutes} phút"
+    if minutes:
+        return f"{minutes} phút {secs} giây"
+    return f"{secs} giây"
+
+
+def _elapsed(started: float) -> str:
+    return format_duration(time.monotonic() - started)
 
 
 def _outcome_level(summary: "Summary") -> str:
@@ -244,6 +261,7 @@ def run(
     """Chạy cả loạt. Hàm này chặn luồng gọi nó, nên GUI phải gọi trong thread riêng."""
     cancel = cancel or threading.Event()
     summary = Summary()
+    started = time.monotonic()
 
     root = Path(settings.input_dir).expanduser()
     if not root.is_dir():
@@ -371,7 +389,7 @@ def run(
     emit(Event(kind="finished", level=_outcome_level(summary), message=(
         f"{'Đã dừng' if summary.cancelled else 'Hoàn tất'}. "
         f"Xong {len(summary.done)}, bỏ qua {len(summary.skipped)}, "
-        f"lỗi {len(summary.failed)}."
+        f"lỗi {len(summary.failed)}. Tổng thời gian {_elapsed(started)}."
     )))
     return summary
 
@@ -381,12 +399,14 @@ def translate_existing(
     emit: Emit = _noop,
     cancel: threading.Event | None = None,
 ) -> Summary:
-    """Dịch các file .srt đã có trong thư mục mà không nhận dạng lại.
+    """Dịch các bản nguyên ngữ .stt đã có mà không nhận dạng lại.
 
-    Dùng cho những video bạn đã làm phụ đề từ trước.
+    Dùng cho những video mà lần chạy trước đã nhận dạng xong nhưng phần dịch
+    còn dở, hoặc khi bạn muốn dịch lại với hướng dẫn xưng hô khác.
     """
     cancel = cancel or threading.Event()
     summary = Summary()
+    started = time.monotonic()
 
     root = Path(settings.input_dir).expanduser()
     if not root.is_dir():
@@ -395,8 +415,8 @@ def translate_existing(
     videos = find_videos(root, recursive=settings.recursive)
     todo: list[tuple[Path, Path, Path]] = []
     for video in videos:
-        source = video.with_suffix(".srt")
-        target = vi_path_for(video)
+        source = stt_path_for(video)
+        target = video.with_suffix(".srt")
         if not has_subtitle(source):
             continue
         if has_subtitle(target) and not settings.overwrite:
@@ -405,10 +425,14 @@ def translate_existing(
             todo.append((video, source, target))
 
     emit(Event(kind="scan", total=len(todo), message=(
-        f"{len(todo)} phụ đề cần dịch, {len(summary.skipped)} đã có bản tiếng Việt."
+        f"{len(todo)} bản nguyên ngữ cần dịch, "
+        f"{len(summary.skipped)} đã có phụ đề tiếng Việt."
     )))
     if not todo:
-        emit(Event(kind="finished", message="Không có phụ đề nào cần dịch.", level="info"))
+        emit(Event(kind="finished", level="info", message=(
+            "Không có bản nguyên ngữ nào cần dịch. "
+            "Nhận dạng trước để có file .stt, rồi mới dịch được."
+        )))
         return summary
 
     forced = replace(settings, translate_enabled=True)
@@ -425,8 +449,11 @@ def translate_existing(
 
         emit(Event(kind="file_start", index=index + 1, total=len(todo),
                    path=video, message=source.name, stage="translate"))
+        file_started = time.monotonic()
         try:
             count = _translate_srt(source, target, translator, settings, emit, cancel)
+            if not settings.keep_stt:
+                source.unlink(missing_ok=True)
         except Cancelled:
             summary.cancelled = True
             break
@@ -440,14 +467,14 @@ def translate_existing(
         summary.done.append(video)
         emit(Event(kind="file_done", index=index + 1, total=len(todo), path=video,
                    level="success", cues=count, translated="done", stage="translate",
-                   message=f"{target.name} - {count} khối đã dịch"))
+                   message=f"{target.name} - {count} khối đã dịch · {_elapsed(file_started)}"))
 
     emit(Event(kind="log", message=f"Tình trạng key: {translator.key_report()}"))
     level = _outcome_level(summary)
     emit(Event(kind="finished", level=level, message=(
         f"{'Đã dừng' if summary.cancelled else 'Dịch xong'}. "
         f"Xong {len(summary.done)}, bỏ qua {len(summary.skipped)}, "
-        f"lỗi {len(summary.failed)}."
+        f"lỗi {len(summary.failed)}. Tổng thời gian {_elapsed(started)}."
     )))
     return summary
 
@@ -463,10 +490,66 @@ def _process_one(
     cancel: threading.Event,
     translator: GeminiTranslator | None = None,
 ) -> tuple[str, int, str]:
-    """Xử lý trọn một video.
+    """Xử lý trọn một video: nhận dạng ra .stt rồi dựng .srt cuối cùng.
 
     Trả về (dòng tóm tắt để ghi log, số khối phụ đề, kết quả phần dịch).
     """
+    started = time.monotonic()
+
+    if job.needs_transcribe:
+        cues, detected = _transcribe_one(
+            job, index, pending, transcriber, settings, prompt, emit, cancel)
+        _write_srt(cues, job.stt)
+    else:
+        # Lần chạy trước đã nhận dạng xong, chỉ dở ở bước sau. Đừng bắt GPU
+        # làm lại phần nặng nhất.
+        cues = parse_srt(job.stt.read_text(encoding=SRT_ENCODING))
+        detected = settings.language
+        emit(Event(kind="log", message=(
+            f"Dùng lại {job.stt.name} từ lần chạy trước, không nhận dạng lại."
+        )))
+
+    emit(Event(kind="file_progress", index=index + 1, path=job.video, progress=1.0))
+    count = len(cues)
+    translated = ""
+
+    if translator is None:
+        # Không dịch thì bản nguyên ngữ chính là bản cuối cùng.
+        _promote(job.stt, job.srt, cues)
+        line = f"{job.srt.name} - {count} khối ({detected or 'không rõ'})"
+    else:
+        emit(Event(kind="translating", index=index + 1, path=job.video,
+                   message=f"Đang dịch {job.stt.name} sang tiếng Việt..."))
+        try:
+            _translate_srt(job.stt, job.srt, translator, settings, emit, cancel)
+            translated = "done"
+            line = f"{job.srt.name} - {count} khối, đã dịch từ {detected or 'không rõ'}"
+            if not settings.keep_stt:
+                job.stt.unlink(missing_ok=True)
+        except Cancelled:
+            raise
+        except Exception as exc:
+            # Dịch hỏng thì bản nguyên ngữ vẫn còn nguyên trong .stt, chạy lại
+            # là dịch tiếp được mà không phải nhận dạng lại từ đầu.
+            translated = "failed"
+            emit(Event(kind="log", level="warn",
+                       message=f"Dịch {job.stt.name} không xong: {exc}"))
+            line = f"{job.stt.name} - {count} khối, CHƯA dịch được"
+
+    return f"{line} · {_elapsed(started)}", count, translated
+
+
+def _transcribe_one(
+    job: Job,
+    index: int,
+    pending: dict[int, Future],
+    transcriber: Transcriber,
+    settings: Settings,
+    prompt: str | None,
+    emit: Emit,
+    cancel: threading.Event,
+) -> tuple[list[Cue], str | None]:
+    """Tách audio, nhận dạng, dựng các khối phụ đề nguyên ngữ."""
     future = pending.pop(index, None)
     if future is None:
         raise RuntimeError("Không tách được audio.")
@@ -493,32 +576,14 @@ def _process_one(
     cues = _build_subtitle(words, detected, settings)
     if not cues:
         raise RuntimeError("Không nhận ra câu thoại nào (video có thể không có tiếng nói).")
+    return cues, detected
 
-    _write_srt(cues, job.srt)
-    emit(Event(kind="file_progress", index=index + 1, path=job.video, progress=1.0))
-    line = f"{job.srt.name} - {len(cues)} khối phụ đề ({detected or 'không rõ'})"
 
-    translated = ""
-    if translator is not None:
-        target = vi_path_for(job.video)
-        if has_subtitle(target) and not settings.overwrite:
-            translated = "skipped"
-            line += " | đã có bản dịch, bỏ qua"
-        else:
-            emit(Event(kind="translating", index=index + 1, path=job.video,
-                       message=f"Đang dịch {job.srt.name} sang tiếng Việt..."))
-            try:
-                _translate_srt(job.srt, target, translator, settings, emit, cancel)
-                translated = "done"
-                line += f" | đã dịch -> {target.name}"
-            except Cancelled:
-                raise
-            except Exception as exc:
-                # Dịch hỏng thì bản nguyên ngữ vẫn còn nguyên, không coi là
-                # video lỗi - chỉ ghi nhận lại để chạy lại phần dịch sau.
-                translated = "failed"
-                emit(Event(kind="log", level="warn",
-                           message=f"Dịch {job.srt.name} không xong: {exc}"))
-                line += " | dịch lỗi"
-
-    return line, len(cues), translated
+def _promote(stt: Path, srt: Path, cues: list[Cue]) -> None:
+    """Đưa bản nguyên ngữ lên thành bản cuối cùng khi không dịch."""
+    try:
+        _replace_with_retry(stt, srt)
+    except OSError:
+        # Đổi tên hỏng thì ghi lại nội dung, miễn sao có file cuối cùng.
+        _write_srt(cues, srt)
+        stt.unlink(missing_ok=True)

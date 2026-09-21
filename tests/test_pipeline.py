@@ -332,95 +332,121 @@ def translating_settings(folder, **overrides):
 
 
 class TestTranslationDuringRun:
-    def test_writes_a_vietnamese_file(self, stub_environment, stub_translator, folder):
-        pipeline.run(translating_settings(folder))
-        assert (folder / "phim1.vi.srt").exists()
-        assert (folder / "phim2.vi.srt").exists()
+    """Sơ đồ file: video -> phim.stt (nguyên ngữ) -> phim.srt (tiếng Việt)."""
 
-    def test_original_subtitle_is_kept(self, stub_environment, stub_translator, folder):
+    def test_final_srt_is_vietnamese(self, stub_environment, stub_translator, folder):
         pipeline.run(translating_settings(folder))
-        original = (folder / "phim1.srt").read_text(encoding="utf-8-sig")
-        assert "天气" in original
-        assert "VI:" not in original
+        assert "VI:" in (folder / "phim1.srt").read_text(encoding="utf-8-sig")
 
-    def test_translated_file_holds_vietnamese(self, stub_environment, stub_translator, folder):
+    def test_stt_is_cleaned_up_by_default(self, stub_environment, stub_translator, folder):
         pipeline.run(translating_settings(folder))
-        assert "VI:" in (folder / "phim1.vi.srt").read_text(encoding="utf-8-sig")
+        assert not (folder / "phim1.stt").exists()
+        assert not (folder / "phim2.stt").exists()
 
-    def test_timings_match_the_original(self, stub_environment, stub_translator, folder):
+    def test_stt_is_kept_when_asked(self, stub_environment, stub_translator, folder):
+        pipeline.run(translating_settings(folder, keep_stt=True))
+        assert (folder / "phim1.stt").exists()
+        assert "天气" in (folder / "phim1.stt").read_text(encoding="utf-8-sig")
+
+    def test_timings_survive_translation(self, stub_environment, stub_translator, folder):
         from videoocr.subtitle import parse_srt
 
-        pipeline.run(translating_settings(folder))
-        source = parse_srt((folder / "phim1.srt").read_text(encoding="utf-8-sig"))
-        target = parse_srt((folder / "phim1.vi.srt").read_text(encoding="utf-8-sig"))
-        assert len(source) == len(target)
-        assert [(c.start, c.end) for c in source] == [(c.start, c.end) for c in target]
+        pipeline.run(translating_settings(folder, keep_stt=True))
+        source = parse_srt((folder / "phim1.stt").read_text(encoding="utf-8-sig"))
+        final = parse_srt((folder / "phim1.srt").read_text(encoding="utf-8-sig"))
+        assert [(c.start, c.end) for c in source] == [(c.start, c.end) for c in final]
 
-    def test_disabled_by_default(self, stub_environment, stub_translator, folder):
+    def test_without_translation_srt_holds_the_original(self, stub_environment, folder):
         pipeline.run(make_settings(folder))
-        assert not (folder / "phim1.vi.srt").exists()
+        assert "天气" in (folder / "phim1.srt").read_text(encoding="utf-8-sig")
+        # .stt chỉ là bản trung gian, không để nó nằm lại làm rác.
+        assert not (folder / "phim1.stt").exists()
 
-    def test_missing_keys_skips_translation_without_failing(
-        self, stub_environment, folder, monkeypatch
-    ):
+    def test_missing_keys_skips_translation_without_failing(self, stub_environment, folder):
         # Không vá GeminiTranslator: bản thật sẽ từ chối vì danh sách key rỗng.
         summary = pipeline.run(make_settings(folder, translate_enabled=True, gemini_keys=[]))
-        assert len(summary.done) == 2          # nhận dạng vẫn xong
-        assert not (folder / "phim1.vi.srt").exists()
+        assert len(summary.done) == 2
+        assert "天气" in (folder / "phim1.srt").read_text(encoding="utf-8-sig")
 
-    def test_translation_failure_keeps_the_original(
+    def test_failed_translation_keeps_the_stt_for_a_retry(
         self, stub_environment, stub_translator, folder, monkeypatch
     ):
         def explode(*args, **kwargs):
             raise RuntimeError("Gemini hỏng")
 
-        summary = pipeline.run(translating_settings(folder))
         monkeypatch.setattr(FakeTranslator, "translate", explode)
-        for name in ["phim1.vi.srt", "phim2.vi.srt"]:
-            (folder / name).unlink()
-        summary = pipeline.run(translating_settings(folder, overwrite=True))
-        assert len(summary.done) == 2          # video không bị tính là lỗi
-        assert (folder / "phim1.srt").exists()
-        assert not (folder / "phim1.vi.srt").exists()
+        summary = pipeline.run(translating_settings(folder))
 
-    def test_existing_translation_is_skipped(self, stub_environment, stub_translator, folder):
+        # Video không bị tính là lỗi, và công nhận dạng vẫn còn nguyên trong .stt.
+        assert len(summary.done) == 2
+        assert (folder / "phim1.stt").exists()
+        assert not (folder / "phim1.srt").exists()
+
+    def test_second_run_reuses_the_stt(self, stub_environment, stub_translator, folder,
+                                       monkeypatch):
+        """Gemini hỏng lượt đầu; lượt sau phải dịch tiếp chứ không nhận dạng lại."""
+        calls = {"n": 0}
+        working = FakeTranslator.translate
+
+        def flaky(self, texts, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("Gemini hỏng")
+            return working(self, texts, **kwargs)
+
+        monkeypatch.setattr(FakeTranslator, "translate", flaky)
         pipeline.run(translating_settings(folder))
-        calls = len(stub_translator["instance"].seen)
-        pipeline.run(translating_settings(folder, overwrite=True))
-        # Lượt hai vẫn nhận dạng lại nhưng thấy .vi.srt đã có nên không dịch thêm.
-        assert len(stub_translator["instance"].seen) >= calls
+        assert (folder / "phim1.stt").exists()
+        assert not (folder / "phim1.srt").exists()
+
+        events = []
+        pipeline.run(translating_settings(folder), emit=events.append)
+        assert any("Dùng lại" in e.message for e in events)
+        assert "VI:" in (folder / "phim1.srt").read_text(encoding="utf-8-sig")
 
 
 class TestTranslateExisting:
-    def test_translates_srt_without_transcribing(self, stub_translator, folder):
-        (folder / "phim1.srt").write_text(
+    def stt(self, folder, name="phim1"):
+        target = folder / f"{name}.stt"
+        target.write_text(
             "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
+        return target
+
+    def test_translates_stt_without_transcribing(self, stub_translator, folder):
+        self.stt(folder)
         summary = pipeline.translate_existing(translating_settings(folder))
         assert len(summary.done) == 1
-        assert "VI:你好" in (folder / "phim1.vi.srt").read_text(encoding="utf-8-sig")
+        assert "VI:你好" in (folder / "phim1.srt").read_text(encoding="utf-8-sig")
 
-    def test_skips_video_without_subtitle(self, stub_translator, folder):
+    def test_removes_stt_afterwards(self, stub_translator, folder):
+        self.stt(folder)
+        pipeline.translate_existing(translating_settings(folder))
+        assert not (folder / "phim1.stt").exists()
+
+    def test_keeps_stt_when_asked(self, stub_translator, folder):
+        self.stt(folder)
+        pipeline.translate_existing(translating_settings(folder, keep_stt=True))
+        assert (folder / "phim1.stt").exists()
+
+    def test_skips_video_without_stt(self, stub_translator, folder):
         summary = pipeline.translate_existing(translating_settings(folder))
         assert summary.done == []
 
-    def test_skips_when_translation_exists(self, stub_translator, folder):
-        (folder / "phim1.srt").write_text(
-            "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
-        (folder / "phim1.vi.srt").write_text("cũ", encoding="utf-8-sig")
+    def test_skips_when_final_srt_exists(self, stub_translator, folder):
+        self.stt(folder)
+        (folder / "phim1.srt").write_text("cũ", encoding="utf-8-sig")
         summary = pipeline.translate_existing(translating_settings(folder))
         assert [p.name for p in summary.skipped] == ["phim1.mp4"]
 
     def test_overwrite_redoes_translation(self, stub_translator, folder):
-        (folder / "phim1.srt").write_text(
-            "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
-        (folder / "phim1.vi.srt").write_text("cũ", encoding="utf-8-sig")
+        self.stt(folder)
+        (folder / "phim1.srt").write_text("cũ", encoding="utf-8-sig")
         pipeline.translate_existing(translating_settings(folder, overwrite=True))
-        assert "VI:" in (folder / "phim1.vi.srt").read_text(encoding="utf-8-sig")
+        assert "VI:" in (folder / "phim1.srt").read_text(encoding="utf-8-sig")
 
     def test_cancel_stops_the_batch(self, stub_translator, folder):
-        for name in ["phim1.srt", "phim2.srt"]:
-            (folder / name).write_text(
-                "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8-sig")
+        self.stt(folder, "phim1")
+        self.stt(folder, "phim2")
         cancel = threading.Event()
         cancel.set()
         summary = pipeline.translate_existing(translating_settings(folder), cancel=cancel)
@@ -429,3 +455,26 @@ class TestTranslateExisting:
     def test_missing_folder_raises(self, stub_translator, tmp_path):
         with pytest.raises(NotADirectoryError):
             pipeline.translate_existing(translating_settings(tmp_path / "khong-co"))
+
+    def test_reports_total_time(self, stub_translator, folder):
+        self.stt(folder)
+        events = []
+        pipeline.translate_existing(translating_settings(folder), emit=events.append)
+        assert "Tổng thời gian" in events[-1].message
+
+
+class TestFormatDuration:
+    def test_seconds(self):
+        assert pipeline.format_duration(12.3) == "12 giây"
+
+    def test_minutes(self):
+        assert pipeline.format_duration(754) == "12 phút 34 giây"
+
+    def test_hours(self):
+        assert pipeline.format_duration(7384) == "2 giờ 3 phút"
+
+    def test_zero(self):
+        assert pipeline.format_duration(0) == "0 giây"
+
+    def test_negative_clamped(self):
+        assert pipeline.format_duration(-5) == "0 giây"
