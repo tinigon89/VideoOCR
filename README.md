@@ -35,6 +35,15 @@ Chạy **`run.bat`** để mở cửa sổ. Chọn thư mục chứa video, bấ
 Lần chạy đầu tiên còn phải tải model Whisper về (`large-v3` khoảng 3 GB), lưu vào
 cache của máy nên những lần sau vào thẳng luôn.
 
+### Thẻ Tiến độ
+
+Vòng tròn bên phải cho biết tiến độ cả loạt, với số phần trăm lớn đọc được từ xa.
+Bên dưới là video đang làm, thời gian đã chạy, **thời gian còn lại ước tính** và
+giờ dự kiến xong. Vài phần trăm đầu app chưa đoán thời gian còn lại vì lúc đó ước
+tính còn lệch nhiều.
+
+Lúc không chạy, vòng tròn cho biết thư mục đang mở đã làm xong bao nhiêu phần.
+
 ### Bảng danh sách video
 
 Ngay khi chọn thư mục, app quét và liệt kê từng video kèm **dung lượng** và **tình
@@ -43,6 +52,10 @@ file đã có SRT và bao nhiêu còn thiếu.
 
 Tích **"Chỉ hiện file chưa có SRT"** để ẩn bớt những file đã xong — tiện khi thư
 mục có hàng trăm video làm dở.
+
+Chấm màu đầu mỗi dòng là tình trạng chung: xám là chưa làm, vàng là đã nhận dạng
+nhưng chờ dịch, xanh dương là đang chạy, xanh lá là xong, đỏ là lỗi. Chữ luôn
+giữ màu đen cho dễ đọc; màu chỉ nằm ở chấm, và luôn có chữ đi kèm.
 
 Bảng có **hai cột trạng thái** ứng với hai bước của quy trình, đổi theo thời gian
 thực trong lúc chạy:

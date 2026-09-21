@@ -231,6 +231,133 @@ class TestCustomInstructions:
         assert "Không gộp hai dòng làm một" in prompt
 
 
+def sent_lines(body: dict) -> list[dict]:
+    """Các dòng cần dịch trong một yêu cầu - phần sau dấu 'Dữ liệu vào'."""
+    text = body["contents"][0]["parts"][0]["text"]
+    return json.loads(text.split("Dữ liệu vào (JSON):\n")[1])
+
+
+def sent_prompt(body: dict) -> str:
+    return body["contents"][0]["parts"][0]["text"]
+
+
+class TestDefaults:
+    def test_batch_is_200_lines(self):
+        assert GeminiTranslator(keys=["k1"]).batch_size == 200
+
+    def test_an_hour_long_film_needs_few_requests(self, fake_api):
+        # Phim 1 tiếng khoảng 800 khối phụ đề.
+        GeminiTranslator(keys=["k1"]).translate([f"câu {i}" for i in range(800)])
+        assert len(fake_api.calls) == 4
+
+
+class TestContextCarryOver:
+    """Lô sau phải thấy vài câu vừa dịch ở lô trước, để giữ nhất quán xưng hô."""
+
+    def test_first_batch_has_no_context(self, fake_api):
+        GeminiTranslator(keys=["k1"], batch_size=3).translate(["a", "b", "c", "d"])
+        assert "Ngữ cảnh" not in sent_prompt(fake_api.bodies[0])
+
+    def test_second_batch_sees_previous_translations(self, fake_api):
+        GeminiTranslator(keys=["k1"], batch_size=3).translate(["a", "b", "c", "d"])
+        prompt = sent_prompt(fake_api.bodies[1])
+        assert "Ngữ cảnh" in prompt
+        assert "VI:c" in prompt          # bản dịch câu cuối của lô trước
+
+    def test_context_is_not_sent_for_translation_again(self, fake_api):
+        GeminiTranslator(keys=["k1"], batch_size=3).translate(["a", "b", "c", "d"])
+        # Lô hai chỉ yêu cầu dịch đúng câu mới, không dịch lại câu ngữ cảnh.
+        assert [item["text"] for item in sent_lines(fake_api.bodies[1])] == ["d"]
+
+    def test_context_is_capped(self, fake_api):
+        from videoocr.translator import CONTEXT_LINES
+
+        t = GeminiTranslator(keys=["k1"], batch_size=50)
+        t.translate([f"câu {i}" for i in range(60)])
+        prompt = sent_prompt(fake_api.bodies[1])
+        pairs = json.loads(prompt.split("kết quả:\n")[1].split("\n")[0])
+        assert len(pairs) == CONTEXT_LINES
+        assert pairs[-1]["da_dich"] == "VI:câu 49"
+
+    def test_untranslated_lines_are_not_used_as_context(self, fake_api):
+        # Gemini bỏ sót câu cuối lô một: không được đưa bản gốc vào làm "bản dịch".
+        fake_api.script = [gemini_reply({0: "VI:a", 1: "VI:b"})]
+        GeminiTranslator(keys=["k1"], batch_size=3).translate(["a", "b", "c", "d"])
+        prompt = sent_prompt(fake_api.bodies[1])
+        assert '"goc": "c"' not in prompt
+
+
+class TestSplitWhenTruncated:
+    """Lô to chạm giới hạn độ dài thì tự chia đôi, không mất trắng cả lô."""
+
+    def make_api(self, monkeypatch, limit: int, how: str = "max_tokens"):
+        calls: list[int] = []
+
+        def fake(url, key, body):
+            lines = sent_lines(body)
+            calls.append(len(lines))
+            if len(lines) > limit:
+                if how == "max_tokens":
+                    return {"candidates": [{"finishReason": "MAX_TOKENS",
+                                            "content": {"parts": [{"text": '{"lines": ['}]}}]}
+                return {"candidates": [{"content": {"parts": [{"text": '{"lines": [{"id"'}]}}]}
+            return gemini_reply({i["id"]: f"VI:{i['text']}" for i in lines})
+
+        monkeypatch.setattr("videoocr.translator._post", fake)
+        monkeypatch.setattr("videoocr.translator.time.sleep", lambda s: None)
+        return calls
+
+    def test_max_tokens_splits_in_half(self, monkeypatch):
+        calls = self.make_api(monkeypatch, limit=100)
+        t = GeminiTranslator(keys=["k1"], batch_size=200)
+        result = t.translate([f"c{i}" for i in range(200)])
+        assert calls == [200, 100, 100]
+        assert all(line.startswith("VI:") for line in result)
+        assert t.stats.splits == 1
+
+    def test_keeps_splitting_until_it_fits(self, monkeypatch):
+        calls = self.make_api(monkeypatch, limit=50)
+        result = GeminiTranslator(keys=["k1"], batch_size=200).translate(
+            [f"c{i}" for i in range(200)])
+        # 200 cụt -> hai nửa 100, mỗi nửa lại cụt -> bốn lô 50 thì lọt.
+        assert calls == [200, 100, 50, 50, 100, 50, 50]
+        assert all(line.startswith("VI:") for line in result)
+
+    def test_broken_json_also_splits(self, monkeypatch):
+        self.make_api(monkeypatch, limit=100, how="broken_json")
+        result = GeminiTranslator(keys=["k1"], batch_size=200).translate(
+            [f"c{i}" for i in range(200)])
+        assert all(line.startswith("VI:") for line in result)
+
+    def test_order_is_preserved_after_split(self, monkeypatch):
+        self.make_api(monkeypatch, limit=60)
+        source = [f"c{i}" for i in range(150)]
+        result = GeminiTranslator(keys=["k1"], batch_size=150).translate(source)
+        assert result == [f"VI:{s}" for s in source]
+
+    def test_second_half_gets_context_from_first_half(self, monkeypatch):
+        bodies = []
+
+        def fake(url, key, body):
+            bodies.append(body)
+            lines = sent_lines(body)
+            if len(lines) > 2:
+                return {"candidates": [{"finishReason": "MAX_TOKENS",
+                                        "content": {"parts": [{"text": ""}]}}]}
+            return gemini_reply({i["id"]: f"VI:{i['text']}" for i in lines})
+
+        monkeypatch.setattr("videoocr.translator._post", fake)
+        monkeypatch.setattr("videoocr.translator.MIN_SPLIT", 1)
+        GeminiTranslator(keys=["k1"], batch_size=4).translate(["a", "b", "c", "d"])
+        assert "VI:b" in sent_prompt(bodies[-1])
+
+    def test_gives_up_when_even_small_batches_are_cut(self, monkeypatch):
+        self.make_api(monkeypatch, limit=0)
+        with pytest.raises(TranslationError):
+            GeminiTranslator(keys=["k1"], batch_size=40).translate(
+                [f"c{i}" for i in range(40)])
+
+
 class TestSortModels:
     def test_gemini_comes_before_other_families(self):
         result = sort_models(["gemma-3-27b-it", "gemini-2.5-flash"])

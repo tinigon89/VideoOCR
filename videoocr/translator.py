@@ -51,6 +51,18 @@ SERVER_ERROR_COOLDOWN = 5.0    # 5xx: trục trặc thoáng qua, nghỉ ngắn
 MAX_ATTEMPTS_PER_BATCH = 6
 MAX_WAIT_FOR_KEY = 90.0
 
+# Mỗi lần gửi bao nhiêu dòng. Lô to thì ít lần gọi hơn, đỡ vướng giới hạn số lần
+# gọi mỗi phút của gói miễn phí: phim 1 tiếng khoảng 800 dòng chỉ còn 4 lần gọi.
+DEFAULT_BATCH = 200
+
+# Số câu đã dịch ngay trước lô hiện tại, gửi kèm để Gemini giữ nhất quán cách
+# xưng hô và tên riêng giữa các lô. Không có phần này thì mỗi lô là một cuộc
+# hội thoại mới, lô đầu dịch "ta - ngươi" lô sau có thể tự chuyển "tôi - anh".
+CONTEXT_LINES = 12
+
+# Lô bị cắt cụt thì chia đôi gửi lại, nhưng không chia nhỏ hơn mức này.
+MIN_SPLIT = 10
+
 PROMPT = """Bạn là người dịch phụ đề phim chuyên nghiệp.
 
 Dịch từng dòng phụ đề dưới đây sang tiếng Việt tự nhiên, đúng văn phong hội thoại.
@@ -63,7 +75,7 @@ Quy tắc bắt buộc:
 - Không thêm lời giải thích, không thêm dấu ngoặc chú thích.
 - Nếu một dòng không có gì để dịch, trả lại đúng nội dung gốc.
 - Xưng hô phải nhất quán trong suốt cả file.
-{extra}
+{extra}{context}
 Dữ liệu vào (JSON):
 {payload}"""
 
@@ -72,6 +84,15 @@ Dữ liệu vào (JSON):
 EXTRA_TEMPLATE = """
 Yêu cầu riêng của người dùng (ưu tiên cao hơn thói quen dịch thông thường):
 {instructions}
+"""
+
+# Các câu ngay trước lô này, đã dịch xong. Nói rõ là chỉ để tham khảo, để model
+# không dịch lại chúng hay chèn chúng vào kết quả.
+CONTEXT_TEMPLATE = """
+Ngữ cảnh - các câu thoại NGAY TRƯỚC đoạn cần dịch, đã dịch xong. Chỉ dùng để giữ
+nhất quán cách xưng hô, tên riêng và giọng văn. KHÔNG dịch lại, KHÔNG đưa vào
+kết quả:
+{pairs}
 """
 
 RESPONSE_SCHEMA = {
@@ -99,6 +120,10 @@ class TranslationError(RuntimeError):
 
 class AllKeysFailedError(TranslationError):
     """Không còn API key nào dùng được."""
+
+
+class ResponseTruncated(TranslationError):
+    """Gemini trả lời bị cắt ngang vì chạm giới hạn độ dài - lô quá to."""
 
 
 @dataclass
@@ -276,6 +301,8 @@ def _extract_text(response: dict) -> str:
     if not candidates:
         feedback = response.get("promptFeedback", {}).get("blockReason")
         raise TranslationError(f"Gemini không trả về nội dung (lý do: {feedback or 'không rõ'})")
+    if candidates[0].get("finishReason") == "MAX_TOKENS":
+        raise ResponseTruncated("Câu trả lời bị cắt ngang vì quá dài.")
     parts = candidates[0].get("content", {}).get("parts") or []
     return "".join(part.get("text", "") for part in parts)
 
@@ -286,6 +313,7 @@ class TranslationStats:
     requests: int = 0
     rotations: int = 0
     missing: int = 0
+    splits: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -294,7 +322,7 @@ class GeminiTranslator:
         self,
         keys: list[str],
         model: str = DEFAULT_MODEL,
-        batch_size: int = 40,
+        batch_size: int = DEFAULT_BATCH,
         target_language: str = "tiếng Việt",
         instructions: str = "",
     ) -> None:
@@ -374,20 +402,31 @@ class GeminiTranslator:
 
     # ----- dịch -----------------------------------------------------------
 
-    def _translate_batch(self, batch: list[tuple[int, str]],
-                         log: Callable[[str, str], None]) -> dict[int, str]:
+    def _prompt(self, batch: list[tuple[int, str]],
+                context: list[tuple[str, str]]) -> str:
         payload = json.dumps(
             [{"id": index, "text": text} for index, text in batch],
             ensure_ascii=False,
         )
         extra = EXTRA_TEMPLATE.format(instructions=self.instructions) if self.instructions else ""
-        prompt = PROMPT.format(count=len(batch), payload=payload, extra=extra)
-        raw = self._call(prompt, log)
+        if context:
+            pairs = json.dumps([{"goc": src, "da_dich": vi} for src, vi in context],
+                               ensure_ascii=False)
+            block = CONTEXT_TEMPLATE.format(pairs=pairs)
+        else:
+            block = ""
+        return PROMPT.format(count=len(batch), payload=payload, extra=extra, context=block)
+
+    def _translate_batch(self, batch: list[tuple[int, str]],
+                         context: list[tuple[str, str]],
+                         log: Callable[[str, str], None]) -> dict[int, str]:
+        raw = self._call(self._prompt(batch, context), log)
 
         try:
             data = json.loads(raw)
         except ValueError as exc:
-            raise TranslationError("Gemini trả về JSON hỏng.") from exc
+            # JSON hỏng gần như luôn là do bị cắt ngang giữa chừng.
+            raise ResponseTruncated("Gemini trả về JSON hỏng.") from exc
 
         result: dict[int, str] = {}
         for item in data.get("lines", []):
@@ -396,6 +435,38 @@ class GeminiTranslator:
             except (KeyError, TypeError, ValueError):
                 continue
         return result
+
+    def _translate_adaptive(self, batch: list[tuple[int, str]],
+                            context: list[tuple[str, str]],
+                            log: Callable[[str, str], None]) -> dict[int, str]:
+        """Dịch một lô; bị cắt cụt thì chia đôi rồi gửi lại từng nửa.
+
+        Nhờ vậy lô to vẫn an toàn: lô 200 dòng chạm giới hạn độ dài thì tự thành
+        hai lô 100, rồi 50 nếu cần, chứ không mất trắng cả 200 dòng.
+        """
+        try:
+            return self._translate_batch(batch, context, log)
+        except ResponseTruncated:
+            if len(batch) <= MIN_SPLIT:
+                raise TranslationError(
+                    f"Gemini vẫn trả lời cụt dù lô chỉ còn {len(batch)} dòng.")
+
+        self.stats.splits += 1
+        middle = len(batch) // 2
+        log(f"Lô {len(batch)} dòng bị cắt cụt, chia đôi gửi lại.", "warn")
+        first = self._translate_adaptive(batch[:middle], context, log)
+        # Nửa sau nhận ngữ cảnh từ chính nửa trước vừa dịch.
+        second = self._translate_adaptive(
+            batch[middle:], self._carry(context, batch[:middle], first), log)
+        return {**first, **second}
+
+    @staticmethod
+    def _carry(context: list[tuple[str, str]], batch: list[tuple[int, str]],
+               translated: dict[int, str]) -> list[tuple[str, str]]:
+        """Ngữ cảnh cho lô kế tiếp: vài câu cuối vừa dịch xong."""
+        fresh = [(text, translated[index]) for index, text in batch
+                 if translated.get(index)]
+        return (context + fresh)[-CONTEXT_LINES:]
 
     def translate(
         self,
@@ -415,6 +486,7 @@ class GeminiTranslator:
 
         total = len(flat)
         done = 0
+        context: list[tuple[str, str]] = []
         for start in range(0, total, self.batch_size):
             if should_cancel is not None and should_cancel():
                 break
@@ -426,7 +498,8 @@ class GeminiTranslator:
                 continue
 
             self.stats.batches += 1
-            translated = self._translate_batch(batch, log)
+            translated = self._translate_adaptive(batch, context, log)
+            context = self._carry(context, batch, translated)
 
             missing = 0
             for index, _ in batch:

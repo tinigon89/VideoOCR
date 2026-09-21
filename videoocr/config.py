@@ -166,13 +166,16 @@ class Settings:
     translate_enabled: bool = False
     gemini_keys: list[str] = field(default_factory=list)
     gemini_model: str = DEFAULT_GEMINI_MODEL
-    translate_batch_size: int = 40
+    translate_batch_size: int = 200    # số dòng mỗi lần gửi Gemini
     # Hướng dẫn riêng cho người dịch: xưng hô, văn phong, tên riêng giữ nguyên...
     translate_prompt: str = ""
     # Giữ lại bản nguyên ngữ .stt sau khi đã dịch xong.
     keep_stt: bool = False
 
     # Trạng thái gập/mở của các khung, để màn hình thấp còn chỗ cho bảng danh sách.
+    # Tăng mỗi khi đổi giá trị mặc định cần chuyển đổi cấu hình cũ.
+    settings_version: int = 2
+
     panel_options_open: bool = True
     panel_translate_open: bool = True
     hide_keys: bool = True
@@ -196,4 +199,20 @@ class Settings:
         except (OSError, ValueError):
             return cls()
         known = {f.name for f in fields(cls)}
+        data = _migrate(data)
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _migrate(data: dict) -> dict:
+    """Nâng cấu hình đã lưu từ bản cũ lên bản hiện tại.
+
+    Chỉ đổi những giá trị mà người dùng chưa từng chỉnh, tức vẫn đúng bằng mặc
+    định cũ - còn giá trị họ tự đặt thì giữ nguyên.
+    """
+    version = data.get("settings_version", 1)
+    if version < 2:
+        # Cỡ lô dịch mặc định đổi từ 40 lên 200 dòng.
+        if data.get("translate_batch_size") == 40:
+            data["translate_batch_size"] = 200
+        data["settings_version"] = 2
+    return data

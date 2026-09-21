@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="API key Gemini. Lặp lại tham số này để thêm nhiều key")
     group.add_argument("--gemini-model", help="Model Gemini (mặc định gemini-2.5-flash)")
     group.add_argument("--translate-batch", type=int, metavar="N",
-                       help="Số dòng gửi mỗi lượt gọi API (mặc định 40)")
+                       help="Số dòng gửi mỗi lượt gọi API (mặc định 200)")
 
     return parser
 

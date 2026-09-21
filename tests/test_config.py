@@ -72,6 +72,27 @@ class TestSettingsRoundTrip:
         original.save(target)
         assert Settings.load(target) == original
 
+    def test_old_default_batch_is_upgraded(self, tmp_path):
+        # Cấu hình lưu từ bản cũ, còn đúng mặc định 40 dòng.
+        target = tmp_path / "settings.json"
+        target.write_text('{"translate_batch_size": 40}', encoding="utf-8")
+        assert Settings.load(target).translate_batch_size == 200
+
+    def test_custom_batch_is_kept(self, tmp_path):
+        # Người dùng tự chỉnh thì không được tự ý đổi.
+        target = tmp_path / "settings.json"
+        target.write_text('{"translate_batch_size": 80}', encoding="utf-8")
+        assert Settings.load(target).translate_batch_size == 80
+
+    def test_new_settings_are_not_migrated_again(self, tmp_path):
+        # Cấu hình mới mà người dùng chủ động đặt 40 thì phải giữ nguyên 40.
+        target = tmp_path / "settings.json"
+        Settings(translate_batch_size=40).save(target)
+        assert Settings.load(target).translate_batch_size == 40
+
+    def test_default_batch_is_200(self):
+        assert Settings().translate_batch_size == 200
+
     def test_default_prompt_is_mandarin(self):
         assert Settings().initial_prompt == DEFAULT_ZH_PROMPT
 
