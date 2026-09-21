@@ -4,6 +4,7 @@ import pytest
 
 from videoocr.scanner import (
     find_videos,
+    natural_key,
     format_size,
     has_subtitle,
     plan_jobs,
@@ -36,6 +37,37 @@ class TestSrtPathFor:
         assert srt_path_for(tmp_path / "phim.s01.e02.mp4").name == "phim.s01.e02.srt"
 
 
+class TestNaturalKey:
+    """Thứ tự này quyết định luôn thứ tự nối khi gộp video, sai là ra file lộn."""
+
+    def test_numbers_compare_as_numbers(self):
+        assert natural_key("Tập 2") < natural_key("Tập 10")
+
+    def test_hundreds_come_last(self):
+        names = ["Tập 1", "Tập 100", "Tập 2", "Tập 20", "Tập 9"]
+        assert sorted(names, key=natural_key) == [
+            "Tập 1", "Tập 2", "Tập 9", "Tập 20", "Tập 100"]
+
+    def test_ignores_letter_case(self):
+        assert natural_key("EP01") == natural_key("ep01")
+
+    def test_leading_zeros_do_not_matter(self):
+        assert natural_key("Tập 007") == natural_key("Tập 7")
+
+    def test_plain_text_still_alphabetical(self):
+        assert sorted(["cam", "anh", "bo"], key=natural_key) == ["anh", "bo", "cam"]
+
+    def test_several_numbers_in_one_name(self):
+        assert natural_key("S1E2") < natural_key("S1E10") < natural_key("S2E1")
+
+    def test_name_starting_with_a_number(self):
+        assert sorted(["10.mp4", "2.mp4"], key=natural_key) == ["2.mp4", "10.mp4"]
+
+    def test_mixed_names_do_not_raise(self):
+        # Chữ và số so với nhau mà lệch kiểu thì Python ném TypeError.
+        sorted(["a", "1", "a1", "1a", "", "a1b2"], key=natural_key)
+
+
 class TestFindVideos:
     def test_recursive_finds_all(self, tree):
         assert len(find_videos(tree, recursive=True)) == 3
@@ -56,6 +88,13 @@ class TestFindVideos:
 
     def test_empty_folder_returns_empty_list(self, tmp_path):
         assert find_videos(tmp_path) == []
+
+    def test_numbered_episodes_come_out_in_order(self, tmp_path):
+        for number in [1, 2, 3, 9, 10, 11, 20, 100]:
+            (tmp_path / f"ShortKit-Tập {number}.mp4").write_bytes(b"x")
+
+        found = [p.name for p in find_videos(tmp_path)]
+        assert found == [f"ShortKit-Tập {n}.mp4" for n in [1, 2, 3, 9, 10, 11, 20, 100]]
 
 
 class TestPlanJobs:

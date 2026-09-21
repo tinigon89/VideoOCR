@@ -11,6 +11,7 @@ Sơ đồ file của một video:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,8 +69,25 @@ def format_size(num_bytes: int) -> str:
     return f"{num_bytes} B"  # pragma: no cover - vòng lặp trên luôn trả về trước
 
 
+_DIGIT_RUNS = re.compile(r"(\d+)")
+
+
+def natural_key(text: str) -> tuple:
+    """Khoá sắp xếp đọc số ra số, để "Tập 2" đứng trước "Tập 10".
+
+    Sắp theo thứ tự từ điển thuần thì "Tập 10" và "Tập 100" chen lên trước
+    "Tập 2" - thứ tự này quyết định cả thứ tự nối khi gộp video nên sai là
+    ra một file lộn tùng phèo.
+
+    ``re.split`` với nhóm bắt luôn trả về chữ và số xen kẽ, chữ ở vị trí chẵn
+    và số ở vị trí lẻ, nên hai khoá bất kỳ luôn so sánh cùng kiểu với nhau.
+    """
+    parts = _DIGIT_RUNS.split(text.lower())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
 def find_videos(root: Path, recursive: bool = True) -> list[Path]:
-    """Tất cả file video dưới ``root``, sắp xếp theo đường dẫn cho ổn định."""
+    """Tất cả file video dưới ``root``, sắp xếp tự nhiên theo đường dẫn."""
     if not root.is_dir():
         raise NotADirectoryError(f"Không phải thư mục: {root}")
 
@@ -78,7 +96,7 @@ def find_videos(root: Path, recursive: bool = True) -> list[Path]:
         p for p in root.glob(pattern)
         if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
     ]
-    return sorted(videos, key=lambda p: str(p).lower())
+    return sorted(videos, key=lambda p: natural_key(str(p)))
 
 
 def plan_jobs(videos: list[Path], overwrite: bool = False) -> tuple[list[Job], list[Path]]:

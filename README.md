@@ -190,6 +190,10 @@ Bấm **"Gộp video..."** để nối toàn bộ video trong danh sách thành 
 đúng thứ tự đang hiện trong bảng. Tiện khi bạn tải về hàng chục clip ngắn của cùng
 một tập phim.
 
+**Thứ tự nối theo tên file, có đọc số ra số** — `Tập 2` đứng trước `Tập 10`, không
+phải kiểu sắp xếp từ điển cho `Tập 10` chen lên trước `Tập 2`. Nhìn bảng danh sách
+là thấy đúng thứ tự sẽ nối; muốn đổi thì đổi tên file.
+
 App tự dò thông số trước khi làm:
 
 - **Cùng codec và độ phân giải** → nối thẳng, không giải mã lại. Nhanh gần bằng
